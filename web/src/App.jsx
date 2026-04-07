@@ -154,7 +154,7 @@ function LoginPage({onStore,onAdmin}) {
     setErr("");
     if(!storeId){setErr("Selecione uma loja.");return;}
     if(!pin){setErr("Digite o PIN.");return;}
-    const s=stores.find(x=>x.id===storeId);
+    const s=stores.find(x=>x.id===store);
     if(!s||s.pin!==pin){setErr("PIN incorreto.");return;}
     onStore({id:s.id,name:s.name});
   };
@@ -163,12 +163,13 @@ function LoginPage({onStore,onAdmin}) {
     const cfg=await sget("config_admin");
     if(!cfg?.pin||cfg.pin!==adminPin){setErr("PIN incorreto.");return;}
     onAdmin();
-  };
+};
   const createPin=async()=>{
-    if(newAdminPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
-    await sset("config_admin",{pin:newAdminPin});
-    setFirstRun(false); setErr("✓ PIN criado! Faça login.");
-  };
+  if(newAdminPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
+  await sset("config_admin",{pin:newAdminPin});
+  setFirstRun(false);
+  onAdmin(); // entra automaticamente
+};
 
   if(!ready) return <div style={{minHeight:"100vh",background:C.bg}}/>;
 
