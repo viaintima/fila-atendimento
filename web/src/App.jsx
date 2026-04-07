@@ -1,5 +1,13 @@
 import { useState, useEffect, useCallback } from "react";
+import {
+  doc, collection, onSnapshot, setDoc, getDoc,
+  getDocs, serverTimestamp, query, orderBy,
+} from "firebase/firestore";
+import { db } from "./firebase.js";
 
+/* ══════════════════════════════════════════════════════
+   CONSTANTS
+══════════════════════════════════════════════════════ */
 const OUTCOMES = [
   { id:"venda",       label:"Venda Realizada",     emoji:"🛍️", isSale:true,  color:"#22c55e" },
   { id:"troca",       label:"Troca Realizada",      emoji:"🔄", isSale:true,  color:"#3b82f6" },
@@ -16,14 +24,9 @@ const C = {
   accent:"#e05c2d", text:"#f5f0e8", green:"#22c55e", red:"#ef4444", yellow:"#f59e0b",
 };
 
-async function sget(key) {
-  try { const r = await window.storage.get(key); return r ? JSON.parse(r.value) : null; }
-  catch { return null; }
-}
-async function sset(key, val) {
-  try { await window.storage.set(key, JSON.stringify(val)); } catch {}
-}
-
+/* ══════════════════════════════════════════════════════
+   HELPERS
+══════════════════════════════════════════════════════ */
 const fmtTime  = iso => iso ? new Date(iso).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}) : "—";
 const fmtDate  = d   => d.toLocaleDateString("pt-BR",{weekday:"long",day:"numeric",month:"long"});
 const fmtClock = d   => d.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
@@ -31,7 +34,22 @@ const fmtShort = iso => iso ? new Date(iso).toLocaleDateString("pt-BR",{day:"2-d
 const uid      = ()  => Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 const cap      = s   => s.charAt(0).toUpperCase()+s.slice(1);
 
-/* ── UI Primitives ─────────────────────────────────── */
+/* ══════════════════════════════════════════════════════
+   FIREBASE HELPERS
+   stores/{id}              → { name, pin, active, createdAt }
+   config/admin             → { pin }
+   sessions/{storeId}       → { startedAt, queue, services, updatedAt }
+   history/{storeId}/days/{dayId} → { startedAt, closedAt, queue, services }
+══════════════════════════════════════════════════════ */
+const storeRef    = id  => doc(db, "stores", id);
+const sessionRef  = id  => doc(db, "sessions", id);
+const adminRef    = ()  => doc(db, "config", "admin");
+const historyCol  = id  => collection(db, "history", id, "days");
+const histDayRef  = (storeId, dayId) => doc(db, "history", storeId, "days", dayId);
+
+/* ══════════════════════════════════════════════════════
+   SHARED UI
+══════════════════════════════════════════════════════ */
 const Inp = ({style={},...p}) => (
   <input style={{display:"block",width:"100%",background:"#1a1210",border:`1px solid ${C.border}`,
     borderRadius:10,padding:"13px 16px",color:C.text,fontSize:15,fontFamily:"inherit",
@@ -121,9 +139,18 @@ export default function App() {
   const [store, setStore]  = useState(null);
   return (
     <>
-      {screen==="login" && <LoginPage onStore={s=>{setStore(s);setScreen("store");}} onAdmin={()=>setScreen("admin")}/>}
-      {screen==="store" && <StoreApp store={store} onLogout={()=>{setStore(null);setScreen("login");}}/>}
-      {screen==="admin" && <AdminDashboard onLogout={()=>setScreen("login")}/>}
+      {screen==="login" && (
+        <LoginPage
+          onStore={s=>{setStore(s);setScreen("store");}}
+          onAdmin={()=>setScreen("admin")}
+        />
+      )}
+      {screen==="store" && (
+        <StoreApp store={store} onLogout={()=>{setStore(null);setScreen("login");}}/>
+      )}
+      {screen==="admin" && (
+        <AdminDashboard onLogout={()=>setScreen("login")}/>
+      )}
     </>
   );
 }
@@ -138,40 +165,48 @@ function LoginPage({onStore,onAdmin}) {
   const [pin,setPin]               = useState("");
   const [adminPin,setAdminPin]     = useState("");
   const [newAdminPin,setNewAdminPin]=useState("");
-  const [firstRun,setFirstRun]     = useState(false);
-  const [ready,setReady]           = useState(false);
+  const [firstRun,setFirstRun]     = useState(null); // null=loading
   const [err,setErr]               = useState("");
 
+  // Load stores in real-time
   useEffect(()=>{
-    (async()=>{
-      const sl=await sget("stores"); setStores(sl||[]);
-      const cfg=await sget("config_admin"); setFirstRun(!cfg?.pin);
-      setReady(true);
-    })();
+    const unsub = onSnapshot(collection(db,"stores"), snap=>{
+      setStores(snap.docs.map(d=>({id:d.id,...d.data()}))
+        .filter(s=>s.active!==false)
+        .sort((a,b)=>a.name.localeCompare(b.name)));
+    });
+    return ()=>unsub();
+  },[]);
+
+  // Check if admin PIN exists
+  useEffect(()=>{
+    getDoc(adminRef()).then(d=>setFirstRun(!d.exists()));
   },[]);
 
   const loginStore=async()=>{
     setErr("");
     if(!storeId){setErr("Selecione uma loja.");return;}
     if(!pin){setErr("Digite o PIN.");return;}
-    const s=stores.find(x=>x.id===store);
-    if(!s||s.pin!==pin){setErr("PIN incorreto.");return;}
-    onStore({id:s.id,name:s.name});
+    const snap=await getDoc(storeRef(storeId));
+    if(!snap.exists()||snap.data().pin!==pin){setErr("PIN incorreto.");return;}
+    onStore({id:storeId,name:snap.data().name});
   };
+
   const loginAdmin=async()=>{
     setErr("");
-    const cfg=await sget("config_admin");
-    if(!cfg?.pin||cfg.pin!==adminPin){setErr("PIN incorreto.");return;}
+    if(!adminPin){setErr("Digite o PIN.");return;}
+    const snap=await getDoc(adminRef());
+    if(!snap.exists()||snap.data().pin!==adminPin){setErr("PIN incorreto.");return;}
     onAdmin();
-};
-  const createPin=async()=>{
-  if(newAdminPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
-  await sset("config_admin",{pin:newAdminPin});
-  setFirstRun(false);
-  onAdmin(); // entra automaticamente
-};
+  };
 
-  if(!ready) return <div style={{minHeight:"100vh",background:C.bg}}/>;
+  const createPin=async()=>{
+    if(newAdminPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
+    await setDoc(adminRef(),{pin:newAdminPin});
+    onAdmin(); // auto-login after creating PIN
+  };
+
+  if(firstRun===null) return <div style={{minHeight:"100vh",background:C.bg}}/>;
 
   return (
     <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Outfit',sans-serif"}}>
@@ -192,7 +227,10 @@ function LoginPage({onStore,onAdmin}) {
             <h1 style={{fontSize:26,fontWeight:800,marginTop:12}}>Sistema de Atendimento</h1>
             <p style={{color:C.muted,fontSize:14,marginTop:6}}>Acesso por loja ou painel administrativo</p>
           </div>
-          <div style={{display:"flex",background:C.surface,borderRadius:12,padding:4,marginBottom:20,border:`1px solid ${C.border}`}}>
+
+          {/* Tabs */}
+          <div style={{display:"flex",background:C.surface,borderRadius:12,padding:4,
+                       marginBottom:20,border:`1px solid ${C.border}`}}>
             {[["store","🏪  Loja"],["admin","⚙️  Administrador"]].map(([t,label])=>(
               <button key={t} onClick={()=>{setTab(t);setErr("");}}
                 style={{flex:1,padding:"10px 0",border:"none",borderRadius:9,fontFamily:"inherit",
@@ -202,40 +240,54 @@ function LoginPage({onStore,onAdmin}) {
               </button>
             ))}
           </div>
+
           <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:16,padding:"24px 28px"}}>
-            {tab==="store" && <>
+            {/* Store Login */}
+            {tab==="store"&&<>
               <p style={{color:C.muted,fontSize:13,marginBottom:18}}>Selecione a loja e insira o PIN</p>
-              {stores.filter(s=>s.active!==false).length===0
-                ? <p style={{color:C.muted,fontSize:14,lineHeight:1.7}}>Nenhuma loja cadastrada.<br/>Acesse como Administrador para criar.</p>
-                : <>
-                    <select value={storeId} onChange={e=>setStoreId(e.target.value)}
-                      style={{display:"block",width:"100%",background:"#1a1210",border:`1px solid ${C.border}`,
-                              borderRadius:10,padding:"13px 16px",fontSize:15,fontFamily:"inherit",marginBottom:14,cursor:"pointer"}}>
-                      <option value="">Selecione a loja…</option>
-                      {stores.filter(s=>s.active!==false).map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
-                    </select>
-                    <Inp type="password" placeholder="PIN da loja" value={pin}
-                         onChange={e=>setPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&loginStore()}/>
-                  </>}
+              {stores.length===0
+                ?<p style={{color:C.muted,fontSize:14,lineHeight:1.7}}>
+                   Nenhuma loja cadastrada.<br/>Acesse como Administrador para criar.
+                 </p>
+                :<>
+                  <select value={storeId} onChange={e=>setStoreId(e.target.value)}
+                    style={{display:"block",width:"100%",background:"#1a1210",
+                            border:`1px solid ${C.border}`,borderRadius:10,padding:"13px 16px",
+                            fontSize:15,fontFamily:"inherit",marginBottom:14,cursor:"pointer",
+                            color:storeId?C.text:C.muted}}>
+                    <option value="">Selecione a loja…</option>
+                    {stores.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                  <Inp type="password" placeholder="PIN da loja" value={pin}
+                       onChange={e=>setPin(e.target.value)}
+                       onKeyDown={e=>e.key==="Enter"&&loginStore()}/>
+                </>}
               {err&&<p style={{color:"#f87171",fontSize:13,marginBottom:12}}>{err}</p>}
-              <Btn variant="primary" style={{width:"100%"}}
-                   disabled={stores.filter(s=>s.active!==false).length===0} onClick={loginStore}>Entrar →</Btn>
+              <Btn variant="primary" style={{width:"100%"}} disabled={stores.length===0} onClick={loginStore}>
+                Entrar →
+              </Btn>
             </>}
-            {tab==="admin" && (firstRun
-              ? <>
-                  <p style={{color:C.muted,fontSize:13,marginBottom:18,lineHeight:1.6}}>👋 Primeira vez — crie o PIN de administrador.</p>
-                  <Inp type="password" placeholder="Criar PIN (mín. 4 dígitos)" value={newAdminPin}
-                       onChange={e=>setNewAdminPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&createPin()}/>
-                  {err&&<p style={{color:err.startsWith("✓")?"#22c55e":"#f87171",fontSize:13,marginBottom:12}}>{err}</p>}
-                  <Btn variant="primary" style={{width:"100%"}} onClick={createPin}>Criar PIN →</Btn>
-                </>
-              : <>
-                  <p style={{color:C.muted,fontSize:13,marginBottom:18}}>PIN de administrador</p>
-                  <Inp type="password" placeholder="PIN de administrador" value={adminPin} autoFocus
-                       onChange={e=>setAdminPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&loginAdmin()}/>
-                  {err&&<p style={{color:"#f87171",fontSize:13,marginBottom:12}}>{err}</p>}
-                  <Btn variant="primary" style={{width:"100%"}} onClick={loginAdmin}>Acessar Painel →</Btn>
-                </>
+
+            {/* Admin Login */}
+            {tab==="admin"&&(firstRun
+              ?<>
+                <p style={{color:C.muted,fontSize:13,marginBottom:18,lineHeight:1.6}}>
+                  👋 Primeira vez — crie o PIN de administrador.
+                </p>
+                <Inp type="password" placeholder="Criar PIN (mín. 4 dígitos)" value={newAdminPin}
+                     onChange={e=>setNewAdminPin(e.target.value)}
+                     onKeyDown={e=>e.key==="Enter"&&createPin()}/>
+                {err&&<p style={{color:"#f87171",fontSize:13,marginBottom:12}}>{err}</p>}
+                <Btn variant="primary" style={{width:"100%"}} onClick={createPin}>Criar PIN e Entrar →</Btn>
+              </>
+              :<>
+                <p style={{color:C.muted,fontSize:13,marginBottom:18}}>PIN de administrador</p>
+                <Inp type="password" placeholder="PIN de administrador" value={adminPin} autoFocus
+                     onChange={e=>setAdminPin(e.target.value)}
+                     onKeyDown={e=>e.key==="Enter"&&loginAdmin()}/>
+                {err&&<p style={{color:"#f87171",fontSize:13,marginBottom:12}}>{err}</p>}
+                <Btn variant="primary" style={{width:"100%"}} onClick={loginAdmin}>Acessar Painel →</Btn>
+              </>
             )}
           </div>
         </div>
@@ -246,9 +298,9 @@ function LoginPage({onStore,onAdmin}) {
 
 /* ══════════════════════════════════════════════════════
    STORE APP
-   Storage model:
-   session_${id}  → { startedAt, queue, services }   ← active open day
-   history_${id}  → [{ id, startedAt, closedAt, queue, services }, …]
+   Firestore model:
+   sessions/{storeId}             → { startedAt, queue, services, updatedAt }
+   history/{storeId}/days/{dayId} → { startedAt, closedAt, queue, services }
 ══════════════════════════════════════════════════════ */
 function StoreApp({store,onLogout}) {
   const [view,setView]               = useState("queue");
@@ -263,33 +315,46 @@ function StoreApp({store,onLogout}) {
   const [now,setNow]                 = useState(new Date());
   const [ready,setReady]             = useState(false);
 
-  const sKey = `session_${store.id}`;
-  const hKey = `history_${store.id}`;
-
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
 
+  // Real-time session listener
   useEffect(()=>{
-    (async()=>{
-      let sess=await sget(sKey);
-      if(!sess){ sess={startedAt:new Date().toISOString(),queue:[],services:[]}; await sset(sKey,sess); }
-      setSession(sess); setQueue(sess.queue||[]); setServices(sess.services||[]);
+    const ref=sessionRef(store.id);
+    const unsub=onSnapshot(ref,async snap=>{
+      if(snap.exists()){
+        const d=snap.data();
+        setSession(d); setQueue(d.queue||[]); setServices(d.services||[]);
+      } else {
+        // First time — create session
+        const newSess={startedAt:new Date().toISOString(),queue:[],services:[],updatedAt:serverTimestamp()};
+        await setDoc(ref,newSess);
+      }
       setReady(true);
-    })();
+    });
+    return ()=>unsub();
   },[store.id]);
 
   const persist=async(nq,ns)=>{
-    const upd={...session,queue:nq??queue,services:ns??services};
-    setSession(upd); await sset(sKey,upd);
+    await setDoc(sessionRef(store.id),{
+      startedAt: session?.startedAt||new Date().toISOString(),
+      queue: nq??queue,
+      services: ns??services,
+      updatedAt: serverTimestamp(),
+    });
   };
 
-  // Close day → save to history, open fresh session
   const closeDay=async()=>{
-    const hist=await sget(hKey)||[];
-    await sset(hKey,[{id:uid(),startedAt:session.startedAt,closedAt:new Date().toISOString(),queue,services},...hist]);
-    const newSess={startedAt:new Date().toISOString(),queue:[],services:[]};
-    await sset(sKey,newSess);
-    setSession(newSess); setQueue([]); setServices([]); setCurSvc(null);
-    setConfirmClose(false); setView("queue");
+    const dayId=uid();
+    await setDoc(histDayRef(store.id,dayId),{
+      startedAt: session?.startedAt||new Date().toISOString(),
+      closedAt: new Date().toISOString(),
+      queue, services,
+    });
+    await setDoc(sessionRef(store.id),{
+      startedAt: new Date().toISOString(),
+      queue:[], services:[], updatedAt:serverTimestamp(),
+    });
+    setConfirmClose(false); setView("queue"); setCurSvc(null);
   };
 
   const activeQ=()=>[...queue].filter(p=>p.status!=="done").sort((a,b)=>{
@@ -300,13 +365,14 @@ function StoreApp({store,onLogout}) {
   });
   const doneQ=()=>queue.filter(p=>p.status==="done");
   const nextP=()=>activeQ().find(p=>p.status==="waiting");
-  const tSvc=services.length, tSales=services.filter(s=>s.isSale).length;
+  const tSvc=services.length,tSales=services.filter(s=>s.isSale).length;
   const conv=tSvc>0?Math.round((tSales/tSvc)*100):0;
 
   const addPerson=async()=>{
     const name=addName.trim();if(!name)return;
-    const nq=[...queue,{id:uid(),name,status:"waiting",entryTime:new Date().toISOString(),
-                        breaks:[],exitTime:null,order:queue.filter(p=>p.status!=="done").length}];
+    const nq=[...queue,{id:uid(),name,status:"waiting",
+      entryTime:new Date().toISOString(),breaks:[],exitTime:null,
+      order:queue.filter(p=>p.status!=="done").length}];
     setQueue(nq); await persist(nq,null); setAddName(""); setShowAdd(false);
   };
   const newCustomer=async()=>{
@@ -320,7 +386,8 @@ function StoreApp({store,onLogout}) {
   const finishService=async(outcomeId)=>{
     if(!curSvc)return;
     const info=OUTCOMES.find(o=>o.id===outcomeId);
-    const ns=[...services,{...curSvc,endTime:new Date().toISOString(),outcome:outcomeId,outcomeLabel:info?.label,isSale:info?.isSale}];
+    const ns=[...services,{...curSvc,endTime:new Date().toISOString(),
+      outcome:outcomeId,outcomeLabel:info?.label,isSale:info?.isSale}];
     const maxOrd=Math.max(...queue.filter(q=>q.status!=="done").map(q=>q.order),0);
     const nq=queue.map(p=>p.id===curSvc.salespersonId?{...p,status:"waiting",order:maxOrd+1}:p);
     setQueue(nq); setServices(ns); setCurSvc(null); await persist(nq,ns);
@@ -343,7 +410,8 @@ function StoreApp({store,onLogout}) {
       nq=queue.map(q=>q.id===id?{...q,status:"waiting",order:mo+1,
         breaks:q.breaks.map((b,i)=>i===q.breaks.length-1?{...b,end:new Date().toISOString()}:b)}:q);
     }else{
-      nq=queue.map(q=>q.id===id?{...q,status:"absent",breaks:[...q.breaks,{start:new Date().toISOString(),end:null}]}:q);
+      nq=queue.map(q=>q.id===id?{...q,status:"absent",
+        breaks:[...q.breaks,{start:new Date().toISOString(),end:null}]}:q);
     }
     setQueue(nq); await persist(nq,null);
   };
@@ -352,14 +420,23 @@ function StoreApp({store,onLogout}) {
     setQueue(nq); setConfirmEnd(null); await persist(nq,null);
   };
 
-  if(!ready) return <AppShell><div style={{padding:40,textAlign:"center",color:C.muted}}>Carregando…</div></AppShell>;
+  if(!ready) return (
+    <AppShell>
+      <div style={{padding:60,textAlign:"center",color:C.muted}}>Carregando…</div>
+    </AppShell>
+  );
 
   const aq=activeQ(),dq=doneQ(),np=nextP();
 
   return (
     <AppShell>
       <Header title={store.name}
-        sub={<>{cap(fmtDate(now))} <span style={{background:"#2c1f1a",padding:"2px 10px",borderRadius:20,fontWeight:500}}>{fmtClock(now)}</span></>}
+        sub={<>
+          {cap(fmtDate(now))}
+          <span style={{background:"#2c1f1a",padding:"2px 10px",borderRadius:20,fontWeight:500}}>
+            {fmtClock(now)}
+          </span>
+        </>}
         actions={<>
           {view==="queue"
             ?<Btn variant="ghost" onClick={()=>setView("report")}>📊 Relatório</Btn>
@@ -369,7 +446,7 @@ function StoreApp({store,onLogout}) {
             <Btn variant="green" onClick={()=>setConfirmClose(true)}>🌙 Encerrar Dia</Btn>
           </>}
           {view==="queue"&&<Btn variant="accent" onClick={()=>setShowAdd(true)}>+ Entrada</Btn>}
-          <Btn variant="ghost" onClick={onLogout} style={{padding:"9px 12px"}}>⎋</Btn>
+          <Btn variant="ghost" onClick={onLogout} style={{padding:"9px 12px"}}>⎋ Sair</Btn>
         </>}
       />
 
@@ -379,7 +456,8 @@ function StoreApp({store,onLogout}) {
         <span>📅 Dia iniciado em {fmtShort(session?.startedAt)} às {fmtTime(session?.startedAt)}</span>
         {view==="queue"&&(
           <button onClick={()=>setView("report")}
-            style={{background:"transparent",border:"none",color:C.accent,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+            style={{background:"transparent",border:"none",color:C.accent,
+                    fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
             Ver relatório + encerrar →
           </button>
         )}
@@ -396,9 +474,10 @@ function StoreApp({store,onLogout}) {
       {view==="queue"&&<>
         <div style={{padding:"4px 20px 16px"}}>
           <button disabled={!np||!!curSvc} onClick={newCustomer}
-            style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,width:"100%",
-                    background:C.accent,border:"none",borderRadius:14,padding:"20px 24px",color:"#fff",
-                    fontSize:19,fontWeight:700,cursor:np&&!curSvc?"pointer":"not-allowed",
+            style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,
+                    width:"100%",background:C.accent,border:"none",borderRadius:14,
+                    padding:"20px 24px",color:"#fff",fontSize:19,fontWeight:700,
+                    cursor:np&&!curSvc?"pointer":"not-allowed",
                     opacity:np&&!curSvc?1:.35,fontFamily:"inherit"}}>
             🛎️ Novo Cliente
             {curSvc&&<Tag>Em atendimento…</Tag>}
@@ -411,11 +490,15 @@ function StoreApp({store,onLogout}) {
             <div style={{textAlign:"center",padding:"36px 20px",color:C.muted,fontSize:14}}>
               <div style={{fontSize:32,marginBottom:8}}>👥</div>
               Nenhuma funcionária na fila
-              <div style={{fontSize:13,opacity:.5,marginTop:6}}>Use "+ Entrada" para registrar o início do expediente</div>
+              <div style={{fontSize:13,opacity:.5,marginTop:6}}>
+                Use "+ Entrada" para registrar o início do expediente
+              </div>
             </div>
           )}
-          {aq.map((p,i)=><PersonCard key={p.id} person={p} position={i+1} isNext={p.id===np?.id}
-            onSkip={()=>skipTurn(p.id)} onAbsent={()=>toggleAbsent(p.id)} onEnd={()=>setConfirmEnd(p.id)}/>)}
+          {aq.map((p,i)=>(
+            <PersonCard key={p.id} person={p} position={i+1} isNext={p.id===np?.id}
+              onSkip={()=>skipTurn(p.id)} onAbsent={()=>toggleAbsent(p.id)} onEnd={()=>setConfirmEnd(p.id)}/>
+          ))}
           {dq.length>0&&<>
             <SecHead dim>Expediente Encerrado</SecHead>
             {dq.map(p=><PersonCard key={p.id} person={p} done/>)}
@@ -425,27 +508,34 @@ function StoreApp({store,onLogout}) {
 
       {/* Report */}
       {view==="report"&&<>
-        <div style={{margin:"16px 20px",background:"#0d1f0d",border:"1px solid #22c55e44",borderRadius:14,
-                     padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{margin:"16px 20px",background:"#0d1f0d",border:"1px solid #22c55e44",
+                     borderRadius:14,padding:"16px 20px",
+                     display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
             <div style={{fontWeight:700,color:C.green,fontSize:14}}>🌙 Encerrar o dia</div>
-            <div style={{fontSize:12,color:C.muted,marginTop:2}}>Salva no histórico e zera para amanhã</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:2}}>
+              Salva no histórico e zera para amanhã
+            </div>
           </div>
           <Btn variant="green" onClick={()=>setConfirmClose(true)}>Encerrar Dia →</Btn>
         </div>
         <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv}/>
       </>}
 
+      {/* Modals */}
       {showAdd&&(
         <Overlay onClose={()=>setShowAdd(false)}>
           <div style={{fontSize:36,marginBottom:12}}>👋</div>
           <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Registrar Entrada</h2>
           <p style={{color:C.muted,fontSize:13,marginBottom:20}}>Adicionar à fila de atendimento</p>
           <Inp autoFocus value={addName} placeholder="Nome da funcionária…"
-               onChange={e=>setAddName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPerson()}/>
+               onChange={e=>setAddName(e.target.value)}
+               onKeyDown={e=>e.key==="Enter"&&addPerson()}/>
           <div style={{display:"flex",gap:8,marginTop:4,justifyContent:"flex-end"}}>
             <Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn>
-            <Btn variant="primary" style={{width:"auto",padding:"10px 20px"}} onClick={addPerson}>Entrar na Fila →</Btn>
+            <Btn variant="primary" style={{width:"auto",padding:"10px 20px"}} onClick={addPerson}>
+              Entrar na Fila →
+            </Btn>
           </div>
         </Overlay>
       )}
@@ -454,7 +544,9 @@ function StoreApp({store,onLogout}) {
         <Overlay closeable={false}>
           <div style={{fontSize:36,marginBottom:12}}>🤝</div>
           <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Resultado do Atendimento</h2>
-          <p style={{color:C.muted,fontSize:13,marginBottom:20}}><strong>{curSvc.salespersonName}</strong> · {fmtTime(curSvc.startTime)}</p>
+          <p style={{color:C.muted,fontSize:13,marginBottom:20}}>
+            <strong>{curSvc.salespersonName}</strong> · {fmtTime(curSvc.startTime)}
+          </p>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
             {OUTCOMES.map(o=>(
               <button key={o.id} onClick={()=>finishService(o.id)}
@@ -466,7 +558,9 @@ function StoreApp({store,onLogout}) {
               </button>
             ))}
           </div>
-          <Btn variant="ghost" style={{width:"100%",marginTop:12,fontSize:13}} onClick={cancelService}>← Cancelar (desfazer)</Btn>
+          <Btn variant="ghost" style={{width:"100%",marginTop:12,fontSize:13}} onClick={cancelService}>
+            ← Cancelar (desfazer)
+          </Btn>
         </Overlay>
       )}
 
@@ -474,7 +568,9 @@ function StoreApp({store,onLogout}) {
         <Overlay onClose={()=>setConfirmEnd(null)}>
           <div style={{fontSize:36,marginBottom:12}}>🚪</div>
           <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Encerrar Expediente?</h2>
-          <p style={{color:C.muted,fontSize:13,marginBottom:20}}>{queue.find(p=>p.id===confirmEnd)?.name} será removida da fila.</p>
+          <p style={{color:C.muted,fontSize:13,marginBottom:20}}>
+            {queue.find(p=>p.id===confirmEnd)?.name} será removida da fila.
+          </p>
           <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
             <Btn variant="ghost" onClick={()=>setConfirmEnd(null)}>Voltar</Btn>
             <Btn variant="danger" onClick={()=>endShift(confirmEnd)}>Confirmar Saída</Btn>
@@ -487,11 +583,13 @@ function StoreApp({store,onLogout}) {
           <div style={{fontSize:36,marginBottom:12}}>🌙</div>
           <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Encerrar o Dia?</h2>
           <p style={{color:C.muted,fontSize:13,marginBottom:8}}>
-            O relatório será salvo no histórico e a fila será zerada para o próximo dia.
+            O relatório será salvo no histórico e a fila será zerada para amanhã.
           </p>
           <div style={{background:"#1a1210",borderRadius:10,padding:"12px 16px",marginBottom:20,fontSize:13}}>
             <div>📊 {tSvc} atendimento{tSvc!==1?"s":""} · {tSales} venda{tSales!==1?"s":""} · {conv}% conversão</div>
-            <div style={{color:C.muted,marginTop:4,fontSize:12}}>Iniciado às {fmtTime(session?.startedAt)}</div>
+            <div style={{color:C.muted,marginTop:4,fontSize:12}}>
+              Iniciado às {fmtTime(session?.startedAt)}
+            </div>
           </div>
           <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
             <Btn variant="ghost" onClick={()=>setConfirmClose(false)}>Cancelar</Btn>
@@ -512,7 +610,7 @@ function AdminDashboard({onLogout}) {
   const [sessions,setSessions]       = useState({});
   const [histories,setHistories]     = useState({});
   const [detailStore,setDetailStore] = useState(null);
-  const [detailRec,setDetailRec]     = useState(null); // {storeName, record}
+  const [detailRec,setDetailRec]     = useState(null);
   const [histStore,setHistStore]     = useState(null);
   const [showAdd,setShowAdd]         = useState(false);
   const [newName,setNewName]         = useState("");
@@ -523,70 +621,103 @@ function AdminDashboard({onLogout}) {
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
 
-  const reload=useCallback(async()=>{
-    const sl=await sget("stores")||[];
-    setStores(sl);
-    const sess={},hist={};
-    for(const s of sl){
-      sess[s.id]=await sget(`session_${s.id}`)||{queue:[],services:[]};
-      hist[s.id]=await sget(`history_${s.id}`)||[];
-    }
-    setSessions(sess); setHistories(hist);
+  // Real-time stores
+  useEffect(()=>{
+    const unsub=onSnapshot(collection(db,"stores"),snap=>{
+      setStores(snap.docs.map(d=>({id:d.id,...d.data()}))
+        .sort((a,b)=>a.name.localeCompare(b.name)));
+    });
+    return ()=>unsub();
   },[]);
 
-  useEffect(()=>{reload();},[reload]);
+  // Real-time sessions for all stores
+  useEffect(()=>{
+    if(stores.length===0)return;
+    const unsubs=stores.map(s=>
+      onSnapshot(sessionRef(s.id),snap=>{
+        setSessions(prev=>({...prev,[s.id]:snap.exists()?snap.data():{queue:[],services:[]}}));
+      })
+    );
+    return ()=>unsubs.forEach(u=>u());
+  },[stores]);
+
+  // Load histories when switching to history tab
+  const loadHistories=useCallback(async()=>{
+    const data={};
+    for(const s of stores){
+      const snap=await getDocs(query(historyCol(s.id),orderBy("closedAt","desc")));
+      data[s.id]=snap.docs.map(d=>({id:d.id,...d.data()}));
+    }
+    setHistories(data);
+  },[stores]);
+
+  useEffect(()=>{
+    if(tab==="history")loadHistories();
+  },[tab,loadHistories]);
 
   const mx=sid=>{
     const d=sessions[sid]||{queue:[],services:[]};
     const sv=d.services||[],q=d.queue||[];
     const sa=sv.filter(s=>s.isSale).length;
-    return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,
-           active:q.filter(p=>p.status!=="done").length,queue:q,services:sv,startedAt:d.startedAt};
+    return{svc:sv.length,sales:sa,
+           conv:sv.length>0?Math.round((sa/sv.length)*100):0,
+           active:q.filter(p=>p.status!=="done").length,
+           queue:q,services:sv,startedAt:d.startedAt};
   };
 
-  const active=stores.filter(s=>s.active!==false);
-  const allSvc  =active.reduce((a,s)=>a+(sessions[s.id]?.services||[]).length,0);
-  const allSales=active.reduce((a,s)=>a+(sessions[s.id]?.services||[]).filter(x=>x.isSale).length,0);
+  const activeStores=stores.filter(s=>s.active!==false);
+  const allSvc  =activeStores.reduce((a,s)=>a+(sessions[s.id]?.services||[]).length,0);
+  const allSales=activeStores.reduce((a,s)=>a+(sessions[s.id]?.services||[]).filter(x=>x.isSale).length,0);
   const allConv =allSvc>0?Math.round((allSales/allSvc)*100):0;
 
   const addStore=async()=>{
     if(!newName.trim()||!newPin.trim())return;
     setSaving(true);
-    const sl=await sget("stores")||[];
-    await sset("stores",[...sl,{id:uid(),name:newName.trim(),pin:newPin.trim(),active:true}]);
-    setNewName("");setNewPin("");setShowAdd(false);setSaving(false);await reload();
-  };
-  const saveEdit=async()=>{
-    if(!editStore)return;setSaving(true);
-    const sl=await sget("stores")||[];
-    await sset("stores",sl.map(s=>s.id===editStore.id?{...s,name:editStore.name,pin:editStore.pin}:s));
-    setEditStore(null);setSaving(false);await reload();
-  };
-  const toggleActive=async(s)=>{
-    const sl=await sget("stores")||[];
-    await sset("stores",sl.map(x=>x.id===s.id?{...x,active:!x.active}:x));
-    await reload();
+    const id=uid();
+    await setDoc(storeRef(id),{
+      name:newName.trim(), pin:newPin.trim(),
+      active:true, createdAt:serverTimestamp(),
+    });
+    setNewName(""); setNewPin(""); setShowAdd(false); setSaving(false);
   };
 
-  // Drill into store's current session
+  const saveEdit=async()=>{
+    if(!editStore)return; setSaving(true);
+    await setDoc(storeRef(editStore.id),
+      {name:editStore.name,pin:editStore.pin},{merge:true});
+    setEditStore(null); setSaving(false);
+  };
+
+  const toggleActive=async(s)=>{
+    await setDoc(storeRef(s.id),{active:!s.active},{merge:true});
+  };
+
+  // Store current session detail
   if(tab==="detail"&&detailStore){
     const m=mx(detailStore.id);
     return(
       <AppShell>
-        <Header title={detailStore.name} sub={<>Dia atual · desde {fmtTime(m.startedAt)}</>}
+        <Header title={detailStore.name}
+          sub={<>Dia atual · desde {fmtTime(m.startedAt)}</>}
           actions={<>
             <Btn variant="ghost" onClick={()=>setTab("overview")}>← Painel</Btn>
-            <Btn variant="accent" onClick={()=>exportPDF(detailStore.name,m.queue,m.services,m.startedAt)}>📄 PDF</Btn>
+            <Btn variant="accent" onClick={()=>exportPDF(detailStore.name,m.queue,m.services,m.startedAt)}>
+              📄 PDF
+            </Btn>
           </>}
         />
-        <StatsBar items={[{num:m.svc,label:"Atendimentos"},{num:m.sales,label:"Vendas",color:C.green},
-          {num:`${m.conv}%`,label:"Conversão"},{num:m.active,label:"Em turno"}]}/>
+        <StatsBar items={[
+          {num:m.svc,label:"Atendimentos"},
+          {num:m.sales,label:"Vendas",color:C.green},
+          {num:`${m.conv}%`,label:"Conversão"},
+          {num:m.active,label:"Em turno"},
+        ]}/>
         <ReportView services={m.services} queue={m.queue} tSvc={m.svc} tSales={m.sales} conv={m.conv}/>
       </AppShell>
     );
   }
 
-  // Drill into a historical record
+  // Historical record detail
   if(tab==="histDetail"&&detailRec){
     const{storeName,record:rec}=detailRec;
     const sv=rec.services||[],q=rec.queue||[];
@@ -600,8 +731,12 @@ function AdminDashboard({onLogout}) {
             <Btn variant="accent" onClick={()=>exportPDF(storeName,q,sv,rec.startedAt)}>📄 PDF</Btn>
           </>}
         />
-        <StatsBar items={[{num:ts,label:"Atendimentos"},{num:tsa,label:"Vendas",color:C.green},
-          {num:`${cr}%`,label:"Conversão"},{num:q.length,label:"Funcionárias"}]}/>
+        <StatsBar items={[
+          {num:ts,label:"Atendimentos"},
+          {num:tsa,label:"Vendas",color:C.green},
+          {num:`${cr}%`,label:"Conversão"},
+          {num:q.length,label:"Funcionárias"},
+        ]}/>
         <ReportView services={sv} queue={q} tSvc={ts} tSales={tsa} conv={cr}/>
       </AppShell>
     );
@@ -611,41 +746,53 @@ function AdminDashboard({onLogout}) {
     <AppShell>
       <Header title="Painel Administrativo" sub={cap(fmtDate(now))}
         actions={<>
-          <Btn variant="ghost" style={tab==="overview"?{borderColor:C.accent,color:C.accent}:{}} onClick={()=>setTab("overview")}>📊 Hoje</Btn>
-          <Btn variant="ghost" style={tab==="history"?{borderColor:C.accent,color:C.accent}:{}} onClick={()=>setTab("history")}>📅 Histórico</Btn>
-          <Btn variant="ghost" style={tab==="stores"?{borderColor:C.accent,color:C.accent}:{}} onClick={()=>setTab("stores")}>🏪 Lojas</Btn>
-          <Btn variant="ghost" onClick={onLogout} style={{padding:"9px 12px"}}>⎋</Btn>
+          <Btn variant="ghost"
+               style={tab==="overview"?{borderColor:C.accent,color:C.accent}:{}}
+               onClick={()=>setTab("overview")}>📊 Hoje</Btn>
+          <Btn variant="ghost"
+               style={tab==="history"?{borderColor:C.accent,color:C.accent}:{}}
+               onClick={()=>setTab("history")}>📅 Histórico</Btn>
+          <Btn variant="ghost"
+               style={tab==="stores"?{borderColor:C.accent,color:C.accent}:{}}
+               onClick={()=>setTab("stores")}>🏪 Lojas</Btn>
+          <Btn variant="ghost" onClick={onLogout} style={{padding:"9px 12px"}}>⎋ Sair</Btn>
         </>}
       />
 
       {/* TODAY */}
       {tab==="overview"&&<>
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,margin:"20px 20px 0"}}>
-          {[{num:active.length,label:"Lojas Ativas"},{num:allSvc,label:"Atendimentos"},
-            {num:allSales,label:"Vendas",color:C.green},{num:`${allConv}%`,label:"Conversão"}]
-            .map((s,i)=>(
-            <div key={i} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"16px 12px",textAlign:"center"}}>
+          {[
+            {num:activeStores.length,label:"Lojas Ativas"},
+            {num:allSvc,label:"Atendimentos"},
+            {num:allSales,label:"Vendas",color:C.green},
+            {num:`${allConv}%`,label:"Conversão"},
+          ].map((s,i)=>(
+            <div key={i} style={{background:C.surface,border:`1px solid ${C.border}`,
+                                  borderRadius:12,padding:"16px 12px",textAlign:"center"}}>
               <div style={{fontSize:28,fontWeight:700,color:s.color||C.text}}>{s.num}</div>
-              <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:".5px",marginTop:4}}>{s.label}</div>
+              <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",
+                           letterSpacing:".5px",marginTop:4}}>{s.label}</div>
             </div>
           ))}
         </div>
         <div style={{padding:"20px"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-            <SecHead>Dias Abertos por Loja</SecHead>
-            <Btn variant="sm" onClick={reload} style={{fontSize:12}}>↻ Atualizar</Btn>
-          </div>
+          <SecHead style={{marginBottom:12}}>Lojas</SecHead>
           {stores.length===0&&(
             <div style={{textAlign:"center",padding:"48px 20px",color:C.muted}}>
               <div style={{fontSize:36,marginBottom:12}}>🏪</div>
               Nenhuma loja cadastrada.
-              <br/><Btn variant="accent" style={{display:"inline-block",marginTop:16}} onClick={()=>setTab("stores")}>Ir para Lojas →</Btn>
+              <br/>
+              <Btn variant="accent" style={{display:"inline-block",marginTop:16}}
+                   onClick={()=>setTab("stores")}>Ir para Lojas →</Btn>
             </div>
           )}
           {stores.map(s=>{
-            const m=mx(s.id);const cc=m.conv>=60?C.green:m.conv>=40?C.yellow:"#f87171";
+            const m=mx(s.id);
+            const cc=m.conv>=60?C.green:m.conv>=40?C.yellow:"#f87171";
             return(
-              <div key={s.id} onClick={()=>{setDetailStore(s);setTab("detail");}}
+              <div key={s.id}
+                onClick={()=>{setDetailStore(s);setTab("detail");}}
                 style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,
                         padding:"16px 20px",marginBottom:10,cursor:"pointer",
                         opacity:s.active===false?.5:1,transition:"border-color .2s"}}
@@ -657,17 +804,25 @@ function AdminDashboard({onLogout}) {
                     {s.active===false
                       ?<div style={{fontSize:12,color:C.muted,marginTop:2}}>Inativa</div>
                       :m.active>0
-                        ?<div style={{fontSize:12,color:C.muted,marginTop:2}}>🟢 {m.active} em turno · desde {fmtTime(m.startedAt)}</div>
-                        :<div style={{fontSize:12,color:C.muted,marginTop:2}}>Sem atividade no momento</div>}
+                        ?<div style={{fontSize:12,color:C.muted,marginTop:2}}>
+                           🟢 {m.active} em turno · desde {fmtTime(m.startedAt)}
+                         </div>
+                        :<div style={{fontSize:12,color:C.muted,marginTop:2}}>
+                           Sem atividade no momento
+                         </div>}
                   </div>
                   {m.svc>0&&(
                     <div style={{display:"flex",gap:20}}>
-                      {[{val:m.svc,label:"Atend.",color:C.text},{val:m.sales,label:"Vendas",color:C.green},{val:`${m.conv}%`,label:"Conv.",color:cc}]
-                        .map(({val,label,color})=>(
-                          <div key={label} style={{textAlign:"center"}}>
-                            <div style={{fontSize:22,fontWeight:700,color}}>{val}</div>
-                            <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:".5px"}}>{label}</div>
-                          </div>
+                      {[
+                        {val:m.svc,label:"Atend.",color:C.text},
+                        {val:m.sales,label:"Vendas",color:C.green},
+                        {val:`${m.conv}%`,label:"Conv.",color:cc},
+                      ].map(({val,label,color})=>(
+                        <div key={label} style={{textAlign:"center"}}>
+                          <div style={{fontSize:22,fontWeight:700,color}}>{val}</div>
+                          <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",
+                                       letterSpacing:".5px"}}>{label}</div>
+                        </div>
                       ))}
                     </div>
                   )}
@@ -682,12 +837,13 @@ function AdminDashboard({onLogout}) {
       {tab==="history"&&(
         <div style={{padding:"20px"}}>
           <SecHead style={{marginBottom:16}}>Histórico de Dias Encerrados</SecHead>
-          {stores.length===0&&<p style={{color:C.muted}}>Nenhuma loja cadastrada.</p>}
-          {stores.every(s=>(histories[s.id]||[]).length===0)&&stores.length>0&&(
+          {stores.every(s=>(histories[s.id]||[]).length===0)&&(
             <div style={{textAlign:"center",padding:"48px 20px",color:C.muted}}>
               <div style={{fontSize:36,marginBottom:12}}>📅</div>
               Nenhum dia encerrado ainda.<br/>
-              <span style={{fontSize:13,opacity:.6}}>Os relatórios aparecerão aqui quando as lojas encerrarem o dia.</span>
+              <span style={{fontSize:13,opacity:.6}}>
+                Os relatórios aparecerão aqui quando as lojas encerrarem o dia.
+              </span>
             </div>
           )}
           {stores.map(s=>{
@@ -699,10 +855,13 @@ function AdminDashboard({onLogout}) {
                 <button onClick={()=>setHistStore(open?null:s.id)}
                   style={{display:"flex",justifyContent:"space-between",alignItems:"center",
                           width:"100%",background:C.surface,border:`1px solid ${C.border}`,
-                          borderRadius:12,padding:"14px 16px",cursor:"pointer",fontFamily:"inherit",color:C.text}}>
+                          borderRadius:12,padding:"14px 16px",cursor:"pointer",
+                          fontFamily:"inherit",color:C.text}}>
                   <div style={{fontWeight:700,fontSize:15}}>{s.name}</div>
                   <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <span style={{fontSize:12,color:C.muted}}>{hist.length} dia{hist.length!==1?"s":""} encerrado{hist.length!==1?"s":""}</span>
+                    <span style={{fontSize:12,color:C.muted}}>
+                      {hist.length} dia{hist.length!==1?"s":""} encerrado{hist.length!==1?"s":""}
+                    </span>
                     <span style={{color:C.muted}}>{open?"▲":"▼"}</span>
                   </div>
                 </button>
@@ -723,15 +882,22 @@ function AdminDashboard({onLogout}) {
                           onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
                           <div>
                             <div style={{fontWeight:600,fontSize:14}}>{fmtShort(rec.startedAt)}</div>
-                            <div style={{fontSize:12,color:C.muted,marginTop:2}}>{fmtTime(rec.startedAt)} – {fmtTime(rec.closedAt)}</div>
+                            <div style={{fontSize:12,color:C.muted,marginTop:2}}>
+                              {fmtTime(rec.startedAt)} – {fmtTime(rec.closedAt)}
+                            </div>
                           </div>
                           <div style={{display:"flex",gap:16}}>
-                            {[{val:sv.length,label:"Atend.",color:C.text},{val:sa,label:"Vendas",color:C.green},{val:`${cr}%`,label:"Conv.",color:cc}]
-                              .map(({val,label,color})=>(
-                                <div key={label} style={{textAlign:"center"}}>
-                                  <div style={{fontSize:18,fontWeight:700,color}}>{val}</div>
-                                  <div style={{fontSize:10,color:C.muted,textTransform:"uppercase"}}>{label}</div>
+                            {[
+                              {val:sv.length,label:"Atend.",color:C.text},
+                              {val:sa,label:"Vendas",color:C.green},
+                              {val:`${cr}%`,label:"Conv.",color:cc},
+                            ].map(({val,label,color})=>(
+                              <div key={label} style={{textAlign:"center"}}>
+                                <div style={{fontSize:18,fontWeight:700,color}}>{val}</div>
+                                <div style={{fontSize:10,color:C.muted,textTransform:"uppercase"}}>
+                                  {label}
                                 </div>
+                              </div>
                             ))}
                           </div>
                         </div>
@@ -752,33 +918,49 @@ function AdminDashboard({onLogout}) {
             <div style={{fontWeight:600}}>Lojas ({stores.length})</div>
             <Btn variant="accent" onClick={()=>setShowAdd(true)}>+ Nova Loja</Btn>
           </div>
-          {stores.length===0&&<div style={{textAlign:"center",padding:"36px",color:C.muted}}>Nenhuma loja ainda.</div>}
+          {stores.length===0&&(
+            <div style={{textAlign:"center",padding:"36px",color:C.muted}}>
+              Nenhuma loja ainda. Clique em "+ Nova Loja".
+            </div>
+          )}
           {stores.map(s=>(
-            <div key={s.id} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,
-                                    padding:"14px 16px",marginBottom:8,opacity:s.active===false?.55:1}}>
+            <div key={s.id} style={{background:C.surface,border:`1px solid ${C.border}`,
+                                    borderRadius:12,padding:"14px 16px",marginBottom:8,
+                                    opacity:s.active===false?.55:1}}>
               {editStore?.id===s.id
                 ?<div>
                     <div style={{display:"flex",gap:8,marginBottom:8}}>
-                      <Inp value={editStore.name} style={{marginBottom:0,flex:1}} onChange={e=>setEditStore({...editStore,name:e.target.value})} placeholder="Nome"/>
-                      <Inp value={editStore.pin} style={{marginBottom:0,width:110}} onChange={e=>setEditStore({...editStore,pin:e.target.value})} placeholder="PIN"/>
+                      <Inp value={editStore.name} style={{marginBottom:0,flex:1}}
+                           onChange={e=>setEditStore({...editStore,name:e.target.value})}
+                           placeholder="Nome"/>
+                      <Inp value={editStore.pin} style={{marginBottom:0,width:110}}
+                           onChange={e=>setEditStore({...editStore,pin:e.target.value})}
+                           placeholder="PIN"/>
                     </div>
                     <div style={{display:"flex",gap:8}}>
                       <Btn variant="ghost" onClick={()=>setEditStore(null)}>Cancelar</Btn>
-                      <Btn variant="accent" disabled={saving} onClick={saveEdit}>{saving?"Salvando…":"Salvar"}</Btn>
+                      <Btn variant="accent" disabled={saving} onClick={saveEdit}>
+                        {saving?"Salvando…":"Salvar"}
+                      </Btn>
                     </div>
                   </div>
                 :<div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                     <div>
                       <div style={{fontWeight:600,fontSize:15}}>{s.name}</div>
                       <div style={{fontSize:12,color:C.muted,marginTop:2}}>
-                        PIN: <code style={{background:"#1a1210",padding:"1px 8px",borderRadius:6,letterSpacing:2}}>{s.pin}</code>
+                        PIN:{" "}
+                        <code style={{background:"#1a1210",padding:"1px 8px",
+                                      borderRadius:6,letterSpacing:2}}>{s.pin}</code>
                         {s.active===false&&<span style={{color:C.red,marginLeft:8}}>· Inativa</span>}
-                        {(histories[s.id]||[]).length>0&&<span style={{marginLeft:8}}>· {(histories[s.id]||[]).length} dias no histórico</span>}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:6}}>
-                      <Btn variant="sm" onClick={()=>setEditStore({id:s.id,name:s.name,pin:s.pin})}>✏️ Editar</Btn>
-                      <Btn variant="sm" style={{color:s.active===false?C.green:C.yellow}} onClick={()=>toggleActive(s)}>
+                      <Btn variant="sm" onClick={()=>setEditStore({id:s.id,name:s.name,pin:s.pin})}>
+                        ✏️ Editar
+                      </Btn>
+                      <Btn variant="sm"
+                           style={{color:s.active===false?C.green:C.yellow}}
+                           onClick={()=>toggleActive(s)}>
                         {s.active===false?"✓ Ativar":"⊘ Pausar"}
                       </Btn>
                     </div>
@@ -789,16 +971,23 @@ function AdminDashboard({onLogout}) {
         </div>
       )}
 
+      {/* Modal: add store */}
       {showAdd&&(
         <Overlay onClose={()=>setShowAdd(false)}>
           <div style={{fontSize:36,marginBottom:12}}>🏪</div>
           <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Nova Loja</h2>
-          <p style={{color:C.muted,fontSize:13,marginBottom:20}}>Defina o nome e o PIN de acesso</p>
-          <Inp autoFocus value={newName} placeholder="Nome da loja…" onChange={e=>setNewName(e.target.value)}/>
-          <Inp value={newPin} placeholder="PIN (ex: 1234)" onChange={e=>setNewPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addStore()}/>
+          <p style={{color:C.muted,fontSize:13,marginBottom:20}}>
+            Defina o nome e o PIN de acesso
+          </p>
+          <Inp autoFocus value={newName} placeholder="Nome da loja…"
+               onChange={e=>setNewName(e.target.value)}/>
+          <Inp value={newPin} placeholder="PIN (ex: 1234)"
+               onChange={e=>setNewPin(e.target.value)}
+               onKeyDown={e=>e.key==="Enter"&&addStore()}/>
           <div style={{display:"flex",gap:8,marginTop:4,justifyContent:"flex-end"}}>
             <Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn>
-            <Btn variant="primary" style={{width:"auto",padding:"10px 20px"}} disabled={saving} onClick={addStore}>
+            <Btn variant="primary" style={{width:"auto",padding:"10px 20px"}}
+                 disabled={saving||!newName.trim()||!newPin.trim()} onClick={addStore}>
               {saving?"Salvando…":"Criar Loja →"}
             </Btn>
           </div>
@@ -813,8 +1002,11 @@ function AdminDashboard({onLogout}) {
 ══════════════════════════════════════════════════════ */
 function PersonCard({person:p,position,isNext,onSkip,onAbsent,onEnd,done}){
   const acc={waiting:isNext?C.accent:"#4b5563",serving:C.green,absent:C.yellow,done:"#374151"}[p.status]||"#4b5563";
-  const badge={waiting:isNext?"🎯 Próxima":`#${position}`,serving:"⚡ Atendendo",absent:"⏸ Ausente",
-    done:`✓ Saiu ${fmtTime(p.exitTime)}`}[p.status]||`#${position}`;
+  const badge={
+    waiting:isNext?"🎯 Próxima":`#${position}`,
+    serving:"⚡ Atendendo",absent:"⏸ Ausente",
+    done:`✓ Saiu ${fmtTime(p.exitTime)}`,
+  }[p.status]||`#${position}`;
   return(
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
                  background:C.surface,borderRadius:12,padding:"13px 14px",marginBottom:8,
@@ -823,9 +1015,12 @@ function PersonCard({person:p,position,isNext,onSkip,onAbsent,onEnd,done}){
         <div style={{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,
                      background:`${acc}22`,color:acc,whiteSpace:"nowrap",flexShrink:0}}>{badge}</div>
         <div>
-          <div style={{fontSize:15,fontWeight:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.name}</div>
+          <div style={{fontSize:15,fontWeight:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+            {p.name}
+          </div>
           <div style={{fontSize:11,color:C.muted,marginTop:2}}>
-            Entrada {fmtTime(p.entryTime)}{p.breaks.length?` · ${p.breaks.length} pausa${p.breaks.length>1?"s":""}`:""}</div>
+            Entrada {fmtTime(p.entryTime)}
+            {p.breaks.length?` · ${p.breaks.length} pausa${p.breaks.length>1?"s":""}`:""}</div>
         </div>
       </div>
       {!done&&(
@@ -852,30 +1047,40 @@ function ReportView({services,queue,tSvc,tSales,conv}){
   return(
     <div style={{padding:"8px 20px 60px"}}>
       <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,margin:"16px 0"}}>
-        {[{n:tSvc,l:"Atendimentos",c:C.text},{n:tSales,l:"Vendas",c:C.green},{n:`${conv}%`,l:"Conversão",c:C.text}].map((s,i)=>(
-          <div key={i} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"20px 16px",textAlign:"center"}}>
-            <div style={{fontSize:36,fontWeight:700,color:s.c}}>{s.n}</div>
-            <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:".5px",marginTop:4}}>{s.l}</div>
-          </div>
-        ))}
+        {[{n:tSvc,l:"Atendimentos",c:C.text},{n:tSales,l:"Vendas",c:C.green},{n:`${conv}%`,l:"Conversão",c:C.text}]
+          .map((s,i)=>(
+            <div key={i} style={{background:C.surface,border:`1px solid ${C.border}`,
+                                  borderRadius:12,padding:"20px 16px",textAlign:"center"}}>
+              <div style={{fontSize:36,fontWeight:700,color:s.c}}>{s.n}</div>
+              <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",
+                           letterSpacing:".5px",marginTop:4}}>{s.l}</div>
+            </div>
+          ))}
       </div>
+
       <RSection title="Motivos de Não Venda">
-        {sR.length===0?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum registro</p>
+        {sR.length===0
+          ?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum registro</p>
           :sR.map(([label,cnt])=>(
             <div key={label} style={{marginBottom:14}}>
               <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:6}}>
-                <span style={{color:"#d4c4b8"}}>{label}</span><span style={{fontWeight:600}}>{cnt}</span>
+                <span style={{color:"#d4c4b8"}}>{label}</span>
+                <span style={{fontWeight:600}}>{cnt}</span>
               </div>
               <div style={{height:6,background:"#1a1210",borderRadius:3,overflow:"hidden"}}>
-                <div style={{height:"100%",width:`${Math.round((cnt/mR)*100)}%`,background:C.accent,borderRadius:3}}/>
+                <div style={{height:"100%",width:`${Math.round((cnt/mR)*100)}%`,
+                             background:C.accent,borderRadius:3}}/>
               </div>
             </div>
           ))}
       </RSection>
+
       <RSection title="Funcionárias">
-        {queue.length===0?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum registro</p>
+        {queue.length===0
+          ?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum registro</p>
           :queue.map(p=>{
-            const ps=services.filter(s=>s.salespersonId===p.id),pv=ps.filter(s=>s.isSale).length;
+            const ps=services.filter(s=>s.salespersonId===p.id);
+            const pv=ps.filter(s=>s.isSale).length;
             return(
               <div key={p.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",
                                        borderBottom:`1px solid #2c201a`,paddingBottom:12,marginBottom:12}}>
@@ -895,10 +1100,13 @@ function ReportView({services,queue,tSvc,tSales,conv}){
             );
           })}
       </RSection>
+
       <RSection title={`Histórico (${services.length})`}>
-        {services.length===0?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum atendimento</p>
+        {services.length===0
+          ?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum atendimento</p>
           :[...services].reverse().map(s=>(
-            <div key={s.id} style={{display:"flex",gap:12,padding:"8px 0",borderBottom:`1px solid #2c201a`,alignItems:"center"}}>
+            <div key={s.id} style={{display:"flex",gap:12,padding:"8px 0",
+                                     borderBottom:`1px solid #2c201a`,alignItems:"center"}}>
               <span style={{fontSize:12,color:C.muted,flexShrink:0}}>{fmtTime(s.startTime)}</span>
               <span style={{fontSize:13,flex:1}}>{s.salespersonName}</span>
               <span style={{fontSize:12,color:s.isSale?C.green:"#f87171"}}>{s.outcomeLabel}</span>
@@ -916,7 +1124,8 @@ function exportPDF(storeName,queue,services,startedAt){
   const nS=services.filter(s=>!s.isSale);
   const tV=services.length,tSa=services.filter(s=>s.isSale).length;
   const cr=tV>0?Math.round((tSa/tV)*100):0;
-  const dur=services.filter(s=>s.startTime&&s.endTime).map(s=>new Date(s.endTime)-new Date(s.startTime));
+  const dur=services.filter(s=>s.startTime&&s.endTime)
+    .map(s=>new Date(s.endTime)-new Date(s.startTime));
   const aD=dur.length?Math.round(dur.reduce((a,b)=>a+b,0)/dur.length/60000):0;
   const hC={};for(let h=8;h<=21;h++)hC[h]=0;
   services.forEach(s=>{const h=new Date(s.startTime).getHours();if(h>=8&&h<=21)hC[h]=(hC[h]||0)+1;});
@@ -931,8 +1140,10 @@ function exportPDF(storeName,queue,services,startedAt){
     const en=p.exitTime?new Date(p.exitTime):new Date();
     const tM=en-new Date(p.entryTime);
     const bM=p.breaks.reduce((a,b)=>{const bE=b.end?new Date(b.end):new Date();return a+(bE-new Date(b.start));},0);
-    const wm=Math.round((tM-bM)/60000),wS=Math.floor(wm/60)>0?`${Math.floor(wm/60)}h ${wm%60}m`:`${wm}m`;
-    const bm=Math.round(bM/60000),bS=bm>0?(Math.floor(bm/60)>0?`${Math.floor(bm/60)}h ${bm%60}m`:`${bm}m`):"—";
+    const wm=Math.round((tM-bM)/60000);
+    const wS=Math.floor(wm/60)>0?`${Math.floor(wm/60)}h ${wm%60}m`:`${wm}m`;
+    const bm=Math.round(bM/60000);
+    const bS=bm>0?(Math.floor(bm/60)>0?`${Math.floor(bm/60)}h ${bm%60}m`:`${bm}m`):"—";
     return{...p,ps,pS,pC,wS,bS};
   }).sort((a,b)=>b.pS-a.pS);
   const best=st.find(p=>p.pS>0),mSS=Math.max(...st.map(p=>p.pS),0);
@@ -941,9 +1152,12 @@ function exportPDF(storeName,queue,services,startedAt){
   const gD=ref.toLocaleDateString("pt-BR",{day:"numeric",month:"long",year:"numeric"});
   const wD=ref.toLocaleDateString("pt-BR",{weekday:"long"});
 
-  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Relatório — ${storeName}</title>
-<style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',sans-serif;color:#111827;font-size:13px;line-height:1.5}
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Relatório — ${storeName}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',sans-serif;color:#111827;font-size:13px;line-height:1.5}
 .pg{max-width:860px;margin:0 auto;padding:48px}
 .rh{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:20px;border-bottom:3px solid #111827;margin-bottom:32px}
 .rh h1{font-size:26px;font-weight:800}.rh .st{font-size:15px;color:#6b7280;margin-top:4px;font-weight:500}
@@ -956,25 +1170,22 @@ function exportPDF(storeName,queue,services,startedAt){
 .kl{font-size:10px;color:#9ca3af;margin-top:5px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
 .ks{font-size:11px;color:#d1d5db;margin-top:3px}.kp.gr .ks{color:#86efac}
 .bd{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#fef9c3;color:#92400e}
-table{width:100%;border-collapse:collapse}thead th{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#9ca3af;padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb}
+table{width:100%;border-collapse:collapse}
+thead th{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#9ca3af;padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb}
 tbody td{padding:9px 10px;border-bottom:1px solid #f3f4f6;vertical-align:middle}tbody tr:last-child td{border-bottom:none}
 .tn{font-weight:600;color:#111827}.tg{color:#15803d;font-weight:600}.td{color:#9ca3af;font-size:12px}.tc{text-align:center}
-.mb{display:flex;align-items:center;gap:8px}.mb-t{flex:1;height:6px;background:#f3f4f6;border-radius:3px;overflow:hidden;min-width:60px}
-.mb-f{height:100%;border-radius:3px}.mb-l{font-size:11px;font-weight:700;width:32px;text-align:right}
-.rb{display:flex;align-items:center;gap:10px;margin-bottom:8px}.rn{flex:0 0 160px;font-size:12px;color:#374151}
-.rt{flex:1;height:10px;background:#f3f4f6;border-radius:5px;overflow:hidden}.rf{height:100%;background:#e05c2d;border-radius:5px}
-.rq{flex:0 0 24px;font-weight:700;font-size:12px;text-align:right}.rp{flex:0 0 36px;font-size:11px;color:#9ca3af;text-align:right}
-.hc{display:flex;align-items:flex-end;gap:5px;height:90px;margin-bottom:6px}
-.hcl{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1}
-.hbw{flex:1;display:flex;align-items:flex-end;width:100%}.hb{width:100%;border-radius:3px 3px 0 0;min-height:2px}
-.hl{font-size:9px;white-space:nowrap}.hct{font-size:9px;font-weight:700;color:#6b7280}
-.hi{display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid #f9fafb;font-size:12px}.hi:last-child{border-bottom:none}
-.ht2{color:#9ca3af;flex:0 0 42px}.hp{flex:1;font-weight:500}.ho{flex:0 0 150px;text-align:right;font-size:11px}
+.mb{display:flex;align-items:center;gap:8px}.mb-t{flex:1;height:6px;background:#f3f4f6;border-radius:3px;overflow:hidden;min-width:60px}.mb-f{height:100%;border-radius:3px}.mb-l{font-size:11px;font-weight:700;width:32px;text-align:right}
+.rb{display:flex;align-items:center;gap:10px;margin-bottom:8px}.rn{flex:0 0 160px;font-size:12px;color:#374151}.rt{flex:1;height:10px;background:#f3f4f6;border-radius:5px;overflow:hidden}.rf{height:100%;background:#e05c2d;border-radius:5px}.rq{flex:0 0 24px;font-weight:700;font-size:12px;text-align:right}.rp{flex:0 0 36px;font-size:11px;color:#9ca3af;text-align:right}
+.hc{display:flex;align-items:flex-end;gap:5px;height:90px;margin-bottom:6px}.hcl{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1}.hbw{flex:1;display:flex;align-items:flex-end;width:100%}.hb{width:100%;border-radius:3px 3px 0 0;min-height:2px}.hl{font-size:9px;white-space:nowrap}.hct{font-size:9px;font-weight:700;color:#6b7280}
+.hi{display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid #f9fafb;font-size:12px}.hi:last-child{border-bottom:none}.ht2{color:#9ca3af;flex:0 0 42px}.hp{flex:1;font-weight:500}.ho{flex:0 0 150px;text-align:right;font-size:11px}
 .ft{margin-top:40px;padding-top:14px;border-top:1px solid #e5e7eb;display:flex;justify-content:space-between;color:#d1d5db;font-size:11px}
-.nb{page-break-inside:avoid}@media print{.pg{padding:24px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+.nb{page-break-inside:avoid}
+@media print{.pg{padding:24px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body><div class="pg">
-<div class="rh"><div><h1>Relatório de Atendimentos</h1><div class="st">${storeName}</div></div>
-<div class="mt"><strong>${gD}</strong>${wD.charAt(0).toUpperCase()+wD.slice(1)}<br>Gerado às ${gT}</div></div>
+<div class="rh">
+  <div><h1>Relatório de Atendimentos</h1><div class="st">${storeName}</div></div>
+  <div class="mt"><strong>${gD}</strong>${wD.charAt(0).toUpperCase()+wD.slice(1)}<br>Gerado às ${gT}</div>
+</div>
 <div class="sc nb"><div class="sc-t">Resumo Executivo</div>
 <div class="kr k4">
 <div class="kp"><div class="kn">${tV}</div><div class="kl">Atendimentos</div></div>
@@ -989,7 +1200,15 @@ ${best?`<div class="kp" style="border-color:#fde68a;background:#fffbeb"><div sty
 </div>
 <div class="sc nb"><div class="sc-t">Performance por Funcionária</div>
 <table><thead><tr><th>Funcionária</th><th>Entrada</th><th>Saída</th><th>Expediente</th><th>Pausas</th><th class="tc">Atend.</th><th class="tc">Vendas</th><th>Conversão</th></tr></thead>
-<tbody>${st.map(p=>`<tr><td class="tn">${p.name}${p.pS===mSS&&mSS>0?" <span class='bd'>★</span>":""}</td><td class="td">${fmtTime(p.entryTime)}</td><td class="td">${p.exitTime?fmtTime(p.exitTime):"—"}</td><td class="td">${p.wS}</td><td class="td">${p.bS}</td><td class="tc" style="font-weight:600">${p.ps.length}</td><td class="tc tg">${p.pS}</td><td><div class="mb"><div class="mb-t"><div class="mb-f" style="width:${p.pC}%;background:${p.pC>=60?"#16a34a":p.pC>=40?"#d97706":"#dc2626"}"></div></div><span class="mb-l" style="color:${p.pC>=60?"#16a34a":p.pC>=40?"#d97706":"#dc2626"}">${p.pC}%</span></div></td></tr>`).join("")}</tbody></table></div>
+<tbody>${st.map(p=>`<tr>
+<td class="tn">${p.name}${p.pS===mSS&&mSS>0?" <span class='bd'>★</span>":""}</td>
+<td class="td">${fmtTime(p.entryTime)}</td>
+<td class="td">${p.exitTime?fmtTime(p.exitTime):"—"}</td>
+<td class="td">${p.wS}</td><td class="td">${p.bS}</td>
+<td class="tc" style="font-weight:600">${p.ps.length}</td>
+<td class="tc tg">${p.pS}</td>
+<td><div class="mb"><div class="mb-t"><div class="mb-f" style="width:${p.pC}%;background:${p.pC>=60?"#16a34a":p.pC>=40?"#d97706":"#dc2626"}"></div></div><span class="mb-l" style="color:${p.pC>=60?"#16a34a":p.pC>=40?"#d97706":"#dc2626"}">${p.pC}%</span></div></td>
+</tr>`).join("")}</tbody></table></div>
 ${services.length>0?`<div class="sc nb"><div class="sc-t">Movimento por Hora</div><div class="hc">${hD.map(([h,c])=>{const ip=parseInt(h)===parseInt(pk?.[0])&&c>0;const bh=mH>0?Math.max((c/mH)*70,c>0?4:0):0;return`<div class="hcl"><div class="hct" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div class="hbw"><div class="hb" style="height:${bh}px;background:${ip?"#e05c2d":c>0?"#374151":"#f3f4f6"}"></div></div><div class="hl" style="color:${ip?"#e05c2d":"#9ca3af"}">${h}h</div></div>`;}).join("")}</div><p style="font-size:11px;color:#9ca3af;margin-top:4px">Laranja = horário de pico</p></div>`:""}
 <div class="sc nb"><div class="sc-t">Motivos de Não Venda</div>
 ${sR.length===0?'<p style="color:#9ca3af">Todos resultaram em venda!</p>':sR.map(([l,c])=>`<div class="rb"><div class="rn">${l}</div><div class="rt"><div class="rf" style="width:${Math.round((c/mR)*100)}%"></div></div><div class="rq">${c}</div><div class="rp">${nS.length?Math.round((c/nS.length)*100):0}%</div></div>`).join("")}
