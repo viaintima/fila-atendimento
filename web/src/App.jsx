@@ -8,15 +8,28 @@ import { db } from "./firebase.js";
 /* ══════════════════════════════════════════════════════
    CONSTANTS
 ══════════════════════════════════════════════════════ */
-const OUTCOMES = [
-  { id:"venda",       label:"Venda Realizada",     emoji:"🛍️", isSale:true,  color:"#22c55e" },
-  { id:"troca",       label:"Troca Realizada",      emoji:"🔄", isSale:true,  color:"#3b82f6" },
-  { id:"sem_produto", label:"Produto Indisponível", emoji:"📦", isSale:false, color:"#f59e0b" },
-  { id:"sem_tamanho", label:"Sem o Tamanho",        emoji:"📏", isSale:false, color:"#f59e0b" },
-  { id:"olhando",     label:"Estava Só Olhando",    emoji:"👀", isSale:false, color:"#9ca3af" },
-  { id:"preco",       label:"Preço Elevado",        emoji:"💸", isSale:false, color:"#ef4444" },
-  { id:"desistiu",    label:"Cliente Desistiu",     emoji:"🚶", isSale:false, color:"#9ca3af" },
-  { id:"outro",       label:"Outro Motivo",         emoji:"📝", isSale:false, color:"#9ca3af" },
+// Step 1 — main result
+const MAIN_OUTCOMES = [
+  { id:"venda", label:"Venda Realizada", emoji:"🛍️", isSale:true,  color:"#22c55e" },
+  { id:"troca", label:"Troca Realizada", emoji:"🔄", isSale:true,  color:"#3b82f6" },
+  { id:"nao_vendeu", label:"Não Vendeu", emoji:"❌", isSale:false, color:"#ef4444" },
+];
+
+// Step 2 — non-sale reasons (shown when "Não Vendeu" is selected)
+const SUB_OUTCOMES = [
+  { id:"reservou",   label:"Reservou para outro dia", emoji:"📅", detail:false },
+  { id:"preco",      label:"Preço Elevado",           emoji:"💸", detail:false },
+  { id:"sem_peca",   label:"Não tinha a peça",        emoji:"📦", detail:true,  detailLabel:"Qual peça?" },
+  { id:"sem_tamanho",label:"Não tinha o tamanho",     emoji:"📏", detail:false },
+  { id:"sem_cor",    label:"Não tinha a cor",         emoji:"🎨", detail:false },
+  { id:"olhando",    label:"Estava só olhando",       emoji:"👀", detail:false },
+  { id:"outro",      label:"Outro Motivo",            emoji:"📝", detail:true,  detailLabel:"Especifique" },
+];
+
+// Flat lookup used by reports/PDF
+const ALL_OUTCOMES = [
+  ...MAIN_OUTCOMES.filter(o=>o.isSale),
+  ...SUB_OUTCOMES.map(o=>({...o, isSale:false, color:"#9ca3af"})),
 ];
 
 const C = {
@@ -308,10 +321,15 @@ function StoreApp({store,onLogout}) {
   const [queue,setQueue]             = useState([]);
   const [services,setServices]       = useState([]);
   const [curSvc,setCurSvc]           = useState(null);
+  const [outcomeStep,setOutcomeStep] = useState("main");
+  const [subDetail,setSubDetail]     = useState("");
   const [showAdd,setShowAdd]         = useState(false);
   const [addName,setAddName]         = useState("");
   const [confirmEnd,setConfirmEnd]   = useState(null);
   const [confirmClose,setConfirmClose]=useState(false);
+  const [editSvc,setEditSvc]         = useState(null);
+  const [editStep,setEditStep]       = useState("main");
+  const [editSubDetail,setEditSubDetail]=useState("");
   const [now,setNow]                 = useState(new Date());
   const [ready,setReady]             = useState(false);
 
@@ -383,19 +401,40 @@ function StoreApp({store,onLogout}) {
     const nq=queue.map(p=>p.id===next.id?{...p,status:"serving"}:p);
     setQueue(nq); await persist(nq,null);
   };
-  const finishService=async(outcomeId)=>{
+    const resolveOutcome=(id,detail="")=>{
+    const main=MAIN_OUTCOMES.find(o=>o.id===id);
+    if(main) return {id,label:main.label,isSale:main.isSale};
+    const sub=SUB_OUTCOMES.find(o=>o.id===id);
+    if(!sub) return {id,label:id,isSale:false};
+    const label=detail?`${sub.label}: ${detail}`:sub.label;
+    return {id,label,isSale:false};
+  };
+
+  const finishService=async(outcomeId,detail="")=>{
     if(!curSvc)return;
-    const info=OUTCOMES.find(o=>o.id===outcomeId);
+    const {label,isSale}=resolveOutcome(outcomeId,detail);
     const ns=[...services,{...curSvc,endTime:new Date().toISOString(),
-      outcome:outcomeId,outcomeLabel:info?.label,isSale:info?.isSale}];
+      outcome:outcomeId,outcomeLabel:label,isSale,detail}];
     const maxOrd=Math.max(...queue.filter(q=>q.status!=="done").map(q=>q.order),0);
     const nq=queue.map(p=>p.id===curSvc.salespersonId?{...p,status:"waiting",order:maxOrd+1}:p);
-    setQueue(nq); setServices(ns); setCurSvc(null); await persist(nq,ns);
+    setQueue(nq); setServices(ns); setCurSvc(null);
+    setOutcomeStep("main"); setSubDetail("");
+    await persist(nq,ns);
+  };
+
+  const editService=async(svcId,outcomeId,detail="")=>{
+    const {label,isSale}=resolveOutcome(outcomeId,detail);
+    const ns=services.map(s=>s.id===svcId
+      ?{...s,outcome:outcomeId,outcomeLabel:label,isSale,detail}
+      :s);
+    setServices(ns); setEditSvc(null); setEditStep("main"); setEditSubDetail("");
+    await persist(null,ns);
   };
   const cancelService=async()=>{
     if(!curSvc)return;
     const nq=queue.map(p=>p.id===curSvc.salespersonId?{...p,status:"waiting"}:p);
-    setQueue(nq); setCurSvc(null); await persist(nq,null);
+    setQueue(nq); setCurSvc(null); setOutcomeStep("main"); setSubDetail("");
+    await persist(nq,null);
   };
   const skipTurn=async(id)=>{
     const maxOrd=Math.max(...queue.filter(q=>q.status!=="done").map(q=>q.order),0);
@@ -519,7 +558,7 @@ function StoreApp({store,onLogout}) {
           </div>
           <Btn variant="green" onClick={()=>setConfirmClose(true)}>Encerrar Dia →</Btn>
         </div>
-        <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv}/>
+        <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv} onEdit={s=>{setEditSvc(s);setEditStep("main");setEditSubDetail("");}}/>
       </>}
 
       {/* Modals */}
@@ -543,23 +582,100 @@ function StoreApp({store,onLogout}) {
       {curSvc&&(
         <Overlay closeable={false}>
           <div style={{fontSize:36,marginBottom:12}}>🤝</div>
-          <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Resultado do Atendimento</h2>
+          <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>
+            {outcomeStep==="main"?"Resultado do Atendimento":"Motivo da Não Venda"}
+          </h2>
           <p style={{color:C.muted,fontSize:13,marginBottom:20}}>
             <strong>{curSvc.salespersonName}</strong> · {fmtTime(curSvc.startTime)}
           </p>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            {OUTCOMES.map(o=>(
-              <button key={o.id} onClick={()=>finishService(o.id)}
-                style={{background:"#1a1210",border:`1px solid ${o.color}55`,borderRadius:12,
-                        padding:"14px 10px",cursor:"pointer",display:"flex",flexDirection:"column",
-                        alignItems:"center",gap:6,fontFamily:"inherit"}}>
-                <span style={{fontSize:22}}>{o.emoji}</span>
-                <span style={{fontSize:12,color:C.text,lineHeight:1.3,textAlign:"center"}}>{o.label}</span>
-              </button>
-            ))}
-          </div>
+
+          {/* STEP 1 — main */}
+          {outcomeStep==="main"&&(
+            <div style={{display:"grid",gridTemplateColumns:"1fr",gap:8}}>
+              {MAIN_OUTCOMES.map(o=>(
+                <button key={o.id}
+                  onClick={()=>{
+                    if(o.id==="nao_vendeu"){ setOutcomeStep("sub"); }
+                    else { finishService(o.id); }
+                  }}
+                  style={{background:"#1a1210",border:`1px solid ${o.color}55`,borderRadius:12,
+                          padding:"16px 14px",cursor:"pointer",display:"flex",alignItems:"center",
+                          gap:12,fontFamily:"inherit",textAlign:"left"}}>
+                  <span style={{fontSize:26}}>{o.emoji}</span>
+                  <span style={{fontSize:14,color:C.text,fontWeight:600}}>{o.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* STEP 2 — sub reasons */}
+          {outcomeStep==="sub"&&(
+            <>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                {SUB_OUTCOMES.map(o=>(
+                  <button key={o.id}
+                    onClick={()=>{
+                      if(!o.detail){ finishService(o.id,""); }
+                      else {
+                        // toggle selection — if already selected, clear
+                        setSubDetail(prev=>prev.startsWith(o.id+":")?"":o.id+":");
+                      }
+                    }}
+                    style={{background: subDetail.startsWith(o.id+":")?"#2c1f1a":"#1a1210",
+                            border:`1px solid ${subDetail.startsWith(o.id+":")?"#e05c2d":"#3d2a2255"}`,
+                            borderRadius:12,padding:"12px 10px",cursor:"pointer",display:"flex",
+                            flexDirection:"column",alignItems:"center",gap:5,fontFamily:"inherit"}}>
+                    <span style={{fontSize:20}}>{o.emoji}</span>
+                    <span style={{fontSize:11,color:C.text,lineHeight:1.3,textAlign:"center"}}>{o.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Detail text field */}
+              {SUB_OUTCOMES.filter(o=>o.detail).map(o=>{
+                if(!subDetail.startsWith(o.id+":")) return null;
+                const detailText=subDetail.slice(o.id.length+1);
+                return(
+                  <div key={o.id} style={{marginTop:12}}>
+                    <input
+                      autoFocus
+                      value={detailText}
+                      onChange={e=>setSubDetail(o.id+":"+e.target.value)}
+                      placeholder={o.detailLabel+"…"}
+                      style={{display:"block",width:"100%",background:"#1a1210",
+                              border:`1px solid ${C.border}`,borderRadius:10,
+                              padding:"11px 14px",color:C.text,fontSize:14,
+                              fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}
+                    />
+                    <Btn variant="accent" style={{width:"100%",marginTop:8}}
+                      disabled={!detailText.trim()}
+                      onClick={()=>finishService(o.id,detailText.trim())}>
+                      Confirmar →
+                    </Btn>
+                  </div>
+                );
+              })}
+
+              {/* Confirm button for options without detail */}
+              {subDetail!==""&&!SUB_OUTCOMES.find(o=>o.detail&&subDetail.startsWith(o.id+":"))&&(()=>{
+                const selId=subDetail.replace(":","");
+                return(
+                  <Btn variant="accent" style={{width:"100%",marginTop:12}}
+                    onClick={()=>finishService(selId,"")}>
+                    Confirmar →
+                  </Btn>
+                );
+              })()}
+
+              <Btn variant="ghost" style={{width:"100%",marginTop:8,fontSize:12}}
+                onClick={()=>{ setOutcomeStep("main"); setSubDetail(""); }}>
+                ← Voltar
+              </Btn>
+            </>
+          )}
+
           <Btn variant="ghost" style={{width:"100%",marginTop:12,fontSize:13}} onClick={cancelService}>
-            ← Cancelar (desfazer)
+            ✕ Cancelar atendimento
           </Btn>
         </Overlay>
       )}
@@ -595,6 +711,82 @@ function StoreApp({store,onLogout}) {
             <Btn variant="ghost" onClick={()=>setConfirmClose(false)}>Cancelar</Btn>
             <Btn variant="green" onClick={closeDay}>✓ Confirmar Encerramento</Btn>
           </div>
+        </Overlay>
+      )}
+
+      {/* ── EDIT SERVICE MODAL ── */}
+      {editSvc&&(
+        <Overlay onClose={()=>{ setEditSvc(null); setEditStep("main"); setEditSubDetail(""); }}>
+          <div style={{fontSize:28,marginBottom:10}}>✏️</div>
+          <h2 style={{fontSize:18,fontWeight:700,marginBottom:6}}>Editar Atendimento</h2>
+          <p style={{color:C.muted,fontSize:12,marginBottom:18}}>
+            {editSvc.salespersonName} · {fmtTime(editSvc.startTime)}<br/>
+            <span style={{color:editSvc.isSale?C.green:"#f87171"}}>Atual: {editSvc.outcomeLabel}</span>
+          </p>
+
+          {editStep==="main"&&(
+            <div style={{display:"grid",gridTemplateColumns:"1fr",gap:8}}>
+              {MAIN_OUTCOMES.map(o=>(
+                <button key={o.id}
+                  onClick={()=>{
+                    if(o.id==="nao_vendeu"){ setEditStep("sub"); }
+                    else { editService(editSvc.id,o.id); }
+                  }}
+                  style={{background:"#1a1210",border:`1px solid ${o.color}55`,borderRadius:12,
+                          padding:"14px",cursor:"pointer",display:"flex",alignItems:"center",
+                          gap:12,fontFamily:"inherit",textAlign:"left"}}>
+                  <span style={{fontSize:22}}>{o.emoji}</span>
+                  <span style={{fontSize:13,color:C.text,fontWeight:600}}>{o.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {editStep==="sub"&&(
+            <>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                {SUB_OUTCOMES.map(o=>(
+                  <button key={o.id}
+                    onClick={()=>{
+                      if(!o.detail){ editService(editSvc.id,o.id,""); }
+                      else { setEditSubDetail(prev=>prev.startsWith(o.id+":")?"":o.id+":"); }
+                    }}
+                    style={{background:editSubDetail.startsWith(o.id+":")?"#2c1f1a":"#1a1210",
+                            border:`1px solid ${editSubDetail.startsWith(o.id+":")?"#e05c2d":"#3d2a2255"}`,
+                            borderRadius:12,padding:"11px 8px",cursor:"pointer",display:"flex",
+                            flexDirection:"column",alignItems:"center",gap:4,fontFamily:"inherit"}}>
+                    <span style={{fontSize:18}}>{o.emoji}</span>
+                    <span style={{fontSize:11,color:C.text,lineHeight:1.3,textAlign:"center"}}>{o.label}</span>
+                  </button>
+                ))}
+              </div>
+              {SUB_OUTCOMES.filter(o=>o.detail).map(o=>{
+                if(!editSubDetail.startsWith(o.id+":")) return null;
+                const dt=editSubDetail.slice(o.id.length+1);
+                return(
+                  <div key={o.id} style={{marginTop:10}}>
+                    <input autoFocus value={dt}
+                      onChange={e=>setEditSubDetail(o.id+":"+e.target.value)}
+                      placeholder={o.detailLabel+"…"}
+                      style={{display:"block",width:"100%",background:"#1a1210",
+                              border:`1px solid ${C.border}`,borderRadius:10,
+                              padding:"10px 14px",color:C.text,fontSize:13,
+                              fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}
+                    />
+                    <Btn variant="accent" style={{width:"100%",marginTop:8}} disabled={!dt.trim()}
+                      onClick={()=>editService(editSvc.id,o.id,dt.trim())}>Confirmar →</Btn>
+                  </div>
+                );
+              })}
+              {editSubDetail!==""&&!SUB_OUTCOMES.find(o=>o.detail&&editSubDetail.startsWith(o.id+":"))&&(()=>{
+                const selId=editSubDetail.replace(":","");
+                return <Btn variant="accent" style={{width:"100%",marginTop:10}}
+                  onClick={()=>editService(editSvc.id,selId,"")}>Confirmar →</Btn>;
+              })()}
+              <Btn variant="ghost" style={{width:"100%",marginTop:8,fontSize:12}}
+                onClick={()=>{ setEditStep("main"); setEditSubDetail(""); }}>← Voltar</Btn>
+            </>
+          )}
         </Overlay>
       )}
     </AppShell>
@@ -1039,7 +1231,7 @@ function PersonCard({person:p,position,isNext,onSkip,onAbsent,onEnd,done}){
 /* ══════════════════════════════════════════════════════
    REPORT VIEW
 ══════════════════════════════════════════════════════ */
-function ReportView({services,queue,tSvc,tSales,conv}){
+function ReportView({services,queue,tSvc,tSales,conv,onEdit}){
   const nS=services.filter(s=>!s.isSale);
   const rC={};nS.forEach(s=>{rC[s.outcomeLabel]=(rC[s.outcomeLabel]||0)+1;});
   const sR=Object.entries(rC).sort((a,b)=>b[1]-a[1]);
@@ -1102,14 +1294,25 @@ function ReportView({services,queue,tSvc,tSales,conv}){
       </RSection>
 
       <RSection title={`Histórico (${services.length})`}>
+        {onEdit&&<p style={{color:C.muted,fontSize:11,marginBottom:12,marginTop:-8}}>
+          Clique em ✏️ para alterar o resultado de um atendimento.
+        </p>}
         {services.length===0
           ?<p style={{color:C.muted,fontSize:13,textAlign:"center"}}>Nenhum atendimento</p>
           :[...services].reverse().map(s=>(
-            <div key={s.id} style={{display:"flex",gap:12,padding:"8px 0",
+            <div key={s.id} style={{display:"flex",gap:10,padding:"8px 0",
                                      borderBottom:`1px solid #2c201a`,alignItems:"center"}}>
               <span style={{fontSize:12,color:C.muted,flexShrink:0}}>{fmtTime(s.startTime)}</span>
               <span style={{fontSize:13,flex:1}}>{s.salespersonName}</span>
-              <span style={{fontSize:12,color:s.isSale?C.green:"#f87171"}}>{s.outcomeLabel}</span>
+              <span style={{fontSize:12,color:s.isSale?C.green:"#f87171",flex:1}}>{s.outcomeLabel}</span>
+              {onEdit&&(
+                <button onClick={()=>onEdit(s)}
+                  style={{background:"transparent",border:`1px solid ${C.border}`,borderRadius:6,
+                          padding:"3px 8px",color:C.muted,fontSize:11,cursor:"pointer",
+                          fontFamily:"inherit",flexShrink:0}}>
+                  ✏️
+                </button>
+              )}
             </div>
           ))}
       </RSection>
