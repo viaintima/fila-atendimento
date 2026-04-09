@@ -338,23 +338,28 @@ function StoreApp({store,onLogout}) {
   // Real-time session listener
   useEffect(()=>{
     const ref=sessionRef(store.id);
-    const unsub=onSnapshot(ref,async snap=>{
+    const unsub=onSnapshot(ref,snap=>{
       if(snap.exists()){
         const d=snap.data();
-        setSession(d); setQueue(d.queue||[]); setServices(d.services||[]);
+        // Only load if session is active (has startedAt)
+        if(d.startedAt){
+          setSession(d); setQueue(d.queue||[]); setServices(d.services||[]);
+        } else {
+          // Idle state after day was closed
+          setSession(null); setQueue([]); setServices([]);
+        }
       } else {
-        // First time — create session
-        const newSess={startedAt:new Date().toISOString(),queue:[],services:[],updatedAt:serverTimestamp()};
-        await setDoc(ref,newSess);
+        // No document yet — idle, waiting for first entry
+        setSession(null); setQueue([]); setServices([]);
       }
       setReady(true);
     });
     return ()=>unsub();
   },[store.id]);
 
-  const persist=async(nq,ns)=>{
+  const persist=async(nq,ns,forceStartedAt)=>{
     await setDoc(sessionRef(store.id),{
-      startedAt: session?.startedAt||new Date().toISOString(),
+      startedAt: forceStartedAt||session?.startedAt||new Date().toISOString(),
       queue: nq??queue,
       services: ns??services,
       updatedAt: serverTimestamp(),
@@ -368,10 +373,12 @@ function StoreApp({store,onLogout}) {
       closedAt: new Date().toISOString(),
       queue, services,
     });
+    // Leave session idle — no startedAt until first entry tomorrow
     await setDoc(sessionRef(store.id),{
-      startedAt: new Date().toISOString(),
+      startedAt: null,
       queue:[], services:[], updatedAt:serverTimestamp(),
     });
+    setSession(null); setQueue([]); setServices([]);
     setConfirmClose(false); setView("queue"); setCurSvc(null);
   };
 
@@ -391,7 +398,9 @@ function StoreApp({store,onLogout}) {
     const nq=[...queue,{id:uid(),name,status:"waiting",
       entryTime:new Date().toISOString(),breaks:[],exitTime:null,
       order:queue.filter(p=>p.status!=="done").length}];
-    setQueue(nq); await persist(nq,null); setAddName(""); setShowAdd(false);
+    // If no active session yet, this entry starts the day
+    const startedAt=session?.startedAt||new Date().toISOString();
+    setQueue(nq); await persist(nq,null,startedAt); setAddName(""); setShowAdd(false);
   };
   const newCustomer=async()=>{
     const next=activeQ().find(p=>p.status==="waiting");
@@ -462,6 +471,47 @@ function StoreApp({store,onLogout}) {
   if(!ready) return (
     <AppShell>
       <div style={{padding:60,textAlign:"center",color:C.muted}}>Carregando…</div>
+    </AppShell>
+  );
+
+  // IDLE STATE — day was closed, waiting for first entry to start a new day
+  if(!session?.startedAt) return (
+    <AppShell>
+      <Header title={store.name}
+        sub={<>{cap(fmtDate(now))} <span style={{background:"#2c1f1a",padding:"2px 10px",borderRadius:20,fontWeight:500}}>{fmtClock(now)}</span></>}
+        actions={<Btn variant="ghost" onClick={onLogout} style={{padding:"9px 12px"}}>⎋ Sair</Btn>}
+      />
+      <div style={{textAlign:"center",padding:"60px 30px",color:C.muted}}>
+        <div style={{fontSize:52,marginBottom:20}}>🌅</div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:10}}>Pronta para começar!</div>
+        <div style={{fontSize:14,marginBottom:8}}>O dia ainda não foi iniciado.</div>
+        <div style={{fontSize:13,opacity:.6,marginBottom:32}}>
+          O dia inicia automaticamente quando a primeira funcionária der entrada.
+        </div>
+        <Btn variant="primary" style={{display:"inline-block",padding:"14px 32px"}}
+          onClick={()=>setShowAdd(true)}>
+          + Registrar Primeira Entrada
+        </Btn>
+      </div>
+
+      {showAdd&&(
+        <Overlay onClose={()=>setShowAdd(false)}>
+          <div style={{fontSize:36,marginBottom:12}}>👋</div>
+          <h2 style={{fontSize:20,fontWeight:700,marginBottom:8}}>Registrar Entrada</h2>
+          <p style={{color:C.muted,fontSize:13,marginBottom:20}}>
+            Isso irá iniciar o dia de <strong>{store.name}</strong>
+          </p>
+          <Inp autoFocus value={addName} placeholder="Nome da funcionária…"
+               onChange={e=>setAddName(e.target.value)}
+               onKeyDown={e=>e.key==="Enter"&&addPerson()}/>
+          <div style={{display:"flex",gap:8,marginTop:4,justifyContent:"flex-end"}}>
+            <Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn>
+            <Btn variant="primary" style={{width:"auto",padding:"10px 20px"}} onClick={addPerson}>
+              Iniciar o Dia →
+            </Btn>
+          </div>
+        </Overlay>
+      )}
     </AppShell>
   );
 
