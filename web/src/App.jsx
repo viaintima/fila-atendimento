@@ -1843,7 +1843,7 @@ ${data.sortedStores.length>1?`
 <div class="hc">${data.sortedHour.map(([h,c])=>{
   const ip=h===data.peakH?.[0]&&c>0;
   const bh=data.maxHour>0?Math.max((c/data.maxHour)*68,c>0?3:0):0;
-  return `<div class="hcl"><div class="hct" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div class="hbw"><div class="hb" style="height:${bh}px;background:${ip?"#e05c2d":c>0?"#374151":"#f3f4f6'}"></div></div><div class="hl" style="color:${ip?"#e05c2d":"#9ca3af"}">${h}h</div></div>`;
+  return `<div class="hcl"><div class="hct" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div class="hbw"><div class="hb" style="height:${bh}px;background:${ip?"#e05c2d":c>0?"#374151":"#f3f4f6"}></div></div><div class="hl" style="color:${ip?"#e05c2d":"#9ca3af"}">${h}h</div></div>`;
 }).join("")}</div>
 ${data.peakH&&data.peakH[1]>0?`<p style="font-size:11px;color:#9ca3af;margin-top:4px">🔥 Pico: ${data.peakH[0]}h com ${data.peakH[1]} atendimento${data.peakH[1]!==1?"s":""}</p>`:""}
 </div>
