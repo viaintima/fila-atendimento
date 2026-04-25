@@ -854,6 +854,12 @@ function AdminDashboard({onLogout}) {
   const [detailStore,setDetailStore] = useState(null);
   const [detailRec,setDetailRec]     = useState(null);
   const [histStore,setHistStore]     = useState(null);
+  const [dashStores,setDashStores]   = useState([]);     // selected store ids
+  const [dashFrom,setDashFrom]       = useState("");     // YYYY-MM-DD
+  const [dashTo,setDashTo]           = useState("");
+  const [dashData,setDashData]       = useState(null);   // compiled result
+  const [dashLoading,setDashLoading] = useState(false);
+  const [allHistories,setAllHistories]= useState({});    // full history cache
   const [showAdd,setShowAdd]         = useState(false);
   const [newName,setNewName]         = useState("");
   const [newPin,setNewPin]           = useState("");
@@ -883,7 +889,7 @@ function AdminDashboard({onLogout}) {
     return ()=>unsubs.forEach(u=>u());
   },[stores]);
 
-  // Load histories when switching to history tab
+  // Load histories (for history tab AND dashboard)
   const loadHistories=useCallback(async()=>{
     const data={};
     for(const s of stores){
@@ -891,11 +897,87 @@ function AdminDashboard({onLogout}) {
       data[s.id]=snap.docs.map(d=>({id:d.id,...d.data()}));
     }
     setHistories(data);
+    setAllHistories(data);
   },[stores]);
 
   useEffect(()=>{
-    if(tab==="history")loadHistories();
+    if(tab==="history"||tab==="dashboard")loadHistories();
   },[tab,loadHistories]);
+
+  // Dashboard: compile data from selected stores + date range
+  const runDashboard=useCallback(()=>{
+    if(!dashFrom||!dashTo||dashStores.length===0){setDashData(null);return;}
+    setDashLoading(true);
+    const from=new Date(dashFrom+"T00:00:00");
+    const to  =new Date(dashTo  +"T23:59:59");
+
+    // Collect all day records within range from selected stores
+    const allSvcs=[], staffMap={}, reasonMap={}, storeMap={};
+    const hC={};for(let h=8;h<=21;h++)hC[h]=0;
+
+    dashStores.forEach(sid=>{
+      const store=stores.find(s=>s.id===sid);
+      storeMap[sid]={name:store?.name||sid,svc:0,sales:0};
+      const hist=allHistories[sid]||[];
+
+      // Also include current open session if it falls within range
+      const curSess=sessions[sid];
+      const allDays=[...hist];
+      if(curSess?.startedAt){
+        const sessDate=new Date(curSess.startedAt);
+        if(sessDate>=from&&sessDate<=to){
+          allDays.push({...curSess,closedAt:null,id:"current"});
+        }
+      }
+
+      allDays.forEach(day=>{
+        const dayDate=new Date(day.startedAt);
+        if(dayDate<from||dayDate>to)return;
+        const svcs=day.services||[];
+        svcs.forEach(sv=>{
+          allSvcs.push({...sv,storeName:store?.name||sid,storeId:sid});
+          storeMap[sid].svc++;
+          if(sv.isSale) storeMap[sid].sales++;
+
+          // hourly
+          const h=new Date(sv.startTime).getHours();
+          if(h>=8&&h<=21) hC[h]=(hC[h]||0)+1;
+
+          // reasons
+          if(!sv.isSale){
+            const lbl=sv.outcomeLabel||"Outro";
+            reasonMap[lbl]=(reasonMap[lbl]||0)+1;
+          }
+
+          // staff
+          const key=`${sid}_${sv.salespersonName}`;
+          if(!staffMap[key]) staffMap[key]={name:sv.salespersonName,store:store?.name||sid,svc:0,sales:0};
+          staffMap[key].svc++;
+          if(sv.isSale) staffMap[key].sales++;
+        });
+      });
+    });
+
+    const totalSvc=allSvcs.length;
+    const totalSales=allSvcs.filter(s=>s.isSale).length;
+    const conv=totalSvc>0?Math.round((totalSales/totalSvc)*100):0;
+    const durs=allSvcs.filter(s=>s.startTime&&s.endTime).map(s=>new Date(s.endTime)-new Date(s.startTime));
+    const avgDur=durs.length?Math.round(durs.reduce((a,b)=>a+b,0)/durs.length/60000):0;
+
+    const sortedReasons=Object.entries(reasonMap).sort((a,b)=>b[1]-a[1]);
+    const sortedStaff=Object.values(staffMap)
+      .map(p=>({...p,conv:p.svc>0?Math.round((p.sales/p.svc)*100):0}))
+      .sort((a,b)=>b.sales-a.sales);
+    const sortedStores=Object.values(storeMap)
+      .map(s=>({...s,conv:s.svc>0?Math.round((s.sales/s.svc)*100):0}))
+      .sort((a,b)=>b.sales-a.sales);
+    const sortedHour=Object.entries(hC).sort((a,b)=>parseInt(a[0])-parseInt(b[0]));
+    const maxHour=Math.max(...sortedHour.map(([,c])=>c),1);
+    const peakH=sortedHour.slice().sort((a,b)=>b[1]-a[1])[0];
+
+    setDashData({totalSvc,totalSales,conv,avgDur,sortedReasons,sortedStaff,sortedStores,sortedHour,maxHour,peakH});
+    setDashLoading(false);
+  },[dashFrom,dashTo,dashStores,allHistories,sessions,stores]);
 
   const mx=sid=>{
     const d=sessions[sid]||{queue:[],services:[]};
@@ -991,6 +1073,9 @@ function AdminDashboard({onLogout}) {
           <Btn variant="ghost"
                style={tab==="overview"?{borderColor:C.accent,color:C.accent}:{}}
                onClick={()=>setTab("overview")}>📊 Hoje</Btn>
+          <Btn variant="ghost"
+               style={tab==="dashboard"?{borderColor:C.accent,color:C.accent}:{}}
+               onClick={()=>setTab("dashboard")}>📈 Dashboard</Btn>
           <Btn variant="ghost"
                style={tab==="history"?{borderColor:C.accent,color:C.accent}:{}}
                onClick={()=>setTab("history")}>📅 Histórico</Btn>
@@ -1154,6 +1239,206 @@ function AdminDashboard({onLogout}) {
       )}
 
       {/* STORES */}
+      {/* ── DASHBOARD ── */}
+      {tab==="dashboard"&&(
+        <div style={{padding:"20px"}}>
+          {/* Filters */}
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:20,marginBottom:16}}>
+            <SecHead style={{marginBottom:14}}>Filtros</SecHead>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+              <div>
+                <div style={{fontSize:11,color:C.muted,marginBottom:6,textTransform:"uppercase",letterSpacing:".5px"}}>Data Inicial</div>
+                <input type="date" value={dashFrom} onChange={e=>setDashFrom(e.target.value)}
+                  style={{width:"100%",background:"#1a1210",border:`1px solid ${C.border}`,borderRadius:8,
+                          padding:"10px 12px",color:C.text,fontSize:13,fontFamily:"inherit",outline:"none",
+                          boxSizing:"border-box",colorScheme:"dark"}}/>
+              </div>
+              <div>
+                <div style={{fontSize:11,color:C.muted,marginBottom:6,textTransform:"uppercase",letterSpacing:".5px"}}>Data Final</div>
+                <input type="date" value={dashTo} onChange={e=>setDashTo(e.target.value)}
+                  style={{width:"100%",background:"#1a1210",border:`1px solid ${C.border}`,borderRadius:8,
+                          padding:"10px 12px",color:C.text,fontSize:13,fontFamily:"inherit",outline:"none",
+                          boxSizing:"border-box",colorScheme:"dark"}}/>
+              </div>
+            </div>
+
+            <div style={{fontSize:11,color:C.muted,marginBottom:8,textTransform:"uppercase",letterSpacing:".5px"}}>Lojas</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
+              <button
+                onClick={()=>setDashStores(dashStores.length===stores.length?[]:stores.map(s=>s.id))}
+                style={{background:dashStores.length===stores.length?"#e05c2d22":"transparent",
+                        border:`1px solid ${dashStores.length===stores.length?C.accent:C.border}`,
+                        borderRadius:20,padding:"5px 14px",color:dashStores.length===stores.length?C.accent:C.muted,
+                        fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+                {dashStores.length===stores.length?"✓ Todas":"Todas"}
+              </button>
+              {stores.map(s=>{
+                const sel=dashStores.includes(s.id);
+                return(
+                  <button key={s.id}
+                    onClick={()=>setDashStores(sel?dashStores.filter(id=>id!==s.id):[...dashStores,s.id])}
+                    style={{background:sel?"#e05c2d22":"transparent",
+                            border:`1px solid ${sel?C.accent:C.border}`,
+                            borderRadius:20,padding:"5px 14px",
+                            color:sel?C.accent:C.muted,fontSize:12,
+                            cursor:"pointer",fontFamily:"inherit"}}>
+                    {sel?"✓ ":""}{s.name}
+                  </button>
+                );
+              })}
+            </div>
+
+            <Btn variant="accent" style={{width:"100%"}}
+              disabled={!dashFrom||!dashTo||dashStores.length===0||dashLoading}
+              onClick={runDashboard}>
+              {dashLoading?"Calculando…":"📈 Gerar Dashboard"}
+            </Btn>
+            {(!dashFrom||!dashTo)&&<p style={{fontSize:12,color:C.muted,marginTop:8,textAlign:"center"}}>
+              Selecione o período e ao menos uma loja
+            </p>}
+          </div>
+
+          {/* Results */}
+          {dashData&&<>
+            {/* KPIs */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+              {[
+                {num:dashData.totalSvc,  label:"Atendimentos",  color:C.text},
+                {num:dashData.totalSales,label:"Vendas",         color:C.green},
+                {num:`${dashData.conv}%`,label:"Conversão",      color:dashData.conv>=60?C.green:dashData.conv>=40?C.yellow:"#f87171"},
+                {num:dashData.avgDur>0?`${dashData.avgDur}'`:"—",label:"Tempo Médio",color:C.text},
+              ].map((k,i)=>(
+                <div key={i} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"16px 12px",textAlign:"center"}}>
+                  <div style={{fontSize:26,fontWeight:700,color:k.color}}>{k.num}</div>
+                  <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:".5px",marginTop:4}}>{k.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Por Loja */}
+            {dashData.sortedStores.length>1&&(
+              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginBottom:14}}>
+                <SecHead style={{marginBottom:14}}>Comparativo por Loja</SecHead>
+                {dashData.sortedStores.map((s,i)=>{
+                  const maxS=dashData.sortedStores[0].sales||1;
+                  const cc=s.conv>=60?C.green:s.conv>=40?C.yellow:"#f87171";
+                  return(
+                    <div key={s.name} style={{marginBottom:16}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                        <span style={{fontSize:13,fontWeight:600}}>{i+1}. {s.name}</span>
+                        <div style={{display:"flex",gap:14,fontSize:12}}>
+                          <span style={{color:C.muted}}>{s.svc} atend.</span>
+                          <span style={{color:C.green,fontWeight:600}}>{s.sales} vendas</span>
+                          <span style={{color:cc,fontWeight:600}}>{s.conv}%</span>
+                        </div>
+                      </div>
+                      <div style={{height:8,background:"#1a1210",borderRadius:4,overflow:"hidden"}}>
+                        <div style={{height:"100%",width:`${Math.round((s.sales/maxS)*100)}%`,
+                                     background:C.accent,borderRadius:4,transition:"width .4s"}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Movimento por hora */}
+            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginBottom:14}}>
+              <SecHead style={{marginBottom:14}}>Movimento por Hora</SecHead>
+              <div style={{display:"flex",alignItems:"flex-end",gap:4,height:80,marginBottom:6}}>
+                {dashData.sortedHour.map(([h,c])=>{
+                  const isPeak=h===dashData.peakH?.[0];
+                  const bh=dashData.maxHour>0?Math.max((c/dashData.maxHour)*68,c>0?3:0):0;
+                  return(
+                    <div key={h} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                      <div style={{fontSize:9,color:C.muted,fontWeight:c>0?700:400,opacity:c>0?1:.3}}>{c>0?c:""}</div>
+                      <div style={{width:"100%",borderRadius:"3px 3px 0 0",
+                                   height:bh,background:isPeak?C.accent:c>0?"#4b3a32":"#1a1210",
+                                   minHeight:c>0?3:0,transition:"height .3s"}}/>
+                      <div style={{fontSize:9,color:isPeak?C.accent:C.muted}}>{h}h</div>
+                    </div>
+                  );
+                })}
+              </div>
+              {dashData.peakH&&dashData.peakH[1]>0&&(
+                <p style={{fontSize:11,color:C.muted,marginTop:4}}>
+                  🔥 Pico: {dashData.peakH[0]}h com {dashData.peakH[1]} atendimento{dashData.peakH[1]!==1?"s":""}
+                </p>
+              )}
+            </div>
+
+            {/* Motivos de não venda */}
+            {dashData.sortedReasons.length>0&&(
+              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginBottom:14}}>
+                <SecHead style={{marginBottom:14}}>Motivos de Não Venda</SecHead>
+                {(()=>{
+                  const total=dashData.sortedReasons.reduce((a,[,c])=>a+c,0);
+                  const maxR=dashData.sortedReasons[0]?.[1]||1;
+                  return dashData.sortedReasons.map(([label,cnt])=>(
+                    <div key={label} style={{marginBottom:14}}>
+                      <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:5}}>
+                        <span style={{color:"#d4c4b8"}}>{label}</span>
+                        <span style={{color:C.muted,fontSize:12}}>{cnt} <span style={{color:C.muted,fontSize:11}}>({Math.round((cnt/total)*100)}%)</span></span>
+                      </div>
+                      <div style={{height:6,background:"#1a1210",borderRadius:3,overflow:"hidden"}}>
+                        <div style={{height:"100%",width:`${Math.round((cnt/maxR)*100)}%`,
+                                     background:C.accent,borderRadius:3}}/>
+                      </div>
+                    </div>
+                  ));
+                })()}
+              </div>
+            )}
+
+            {/* Performance vendedoras */}
+            {dashData.sortedStaff.length>0&&(
+              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginBottom:14}}>
+                <SecHead style={{marginBottom:14}}>Performance por Vendedora</SecHead>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,auto) 1fr auto",gap:"6px 12px",alignItems:"center"}}>
+                  {["Vendedora","Loja","Atend.","Conversão","Vendas"].map(h=>(
+                    <div key={h} style={{fontSize:10,color:C.muted,textTransform:"uppercase",
+                                         letterSpacing:".5px",paddingBottom:8,borderBottom:`1px solid ${C.border}`}}>{h}</div>
+                  ))}
+                  {dashData.sortedStaff.map((p,i)=>{
+                    const cc=p.conv>=60?C.green:p.conv>=40?C.yellow:"#f87171";
+                    const maxSales=dashData.sortedStaff[0].sales||1;
+                    return(<>
+                      <div key={p.name+"n"} style={{fontSize:13,fontWeight:600,paddingBottom:8,
+                                                     borderBottom:`1px solid #1a1210`}}>
+                        {i===0&&"★ "}{p.name}
+                      </div>
+                      <div key={p.name+"s"} style={{fontSize:12,color:C.muted,paddingBottom:8,
+                                                     borderBottom:`1px solid #1a1210`}}>{p.store}</div>
+                      <div key={p.name+"a"} style={{fontSize:13,paddingBottom:8,
+                                                     borderBottom:`1px solid #1a1210`,textAlign:"center"}}>{p.svc}</div>
+                      <div key={p.name+"b"} style={{paddingBottom:8,borderBottom:`1px solid #1a1210`}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <div style={{flex:1,height:6,background:"#1a1210",borderRadius:3,overflow:"hidden"}}>
+                            <div style={{height:"100%",width:`${p.conv}%`,background:cc,borderRadius:3}}/>
+                          </div>
+                          <span style={{fontSize:11,fontWeight:700,color:cc,width:32}}>{p.conv}%</span>
+                        </div>
+                      </div>
+                      <div key={p.name+"v"} style={{fontSize:14,fontWeight:700,color:C.green,
+                                                     paddingBottom:8,borderBottom:`1px solid #1a1210`,
+                                                     textAlign:"center"}}>{p.sales}</div>
+                    </>);
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Export PDF */}
+            <button onClick={()=>exportDashPDF(dashData,dashFrom,dashTo,stores.filter(s=>dashStores.includes(s.id)).map(s=>s.name))}
+              style={{width:"100%",background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,
+                      padding:"14px",color:C.text,fontSize:13,fontWeight:600,cursor:"pointer",
+                      fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              📄 Exportar Dashboard em PDF
+            </button>
+          </>}
+        </div>
+      )}
+
       {tab==="stores"&&(
         <div style={{padding:"20px"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
@@ -1471,6 +1756,124 @@ ${queue.some(p=>p.breaks.length>0)?`<div class="sc nb"><div class="sc-t">Registr
 ${services.length===0?'<p style="color:#9ca3af">Nenhum atendimento.</p>':services.map(s=>`<div class="hi"><span class="ht2">${fmtTime(s.startTime)}</span><span class="hp">${s.salespersonName}</span><span class="ho" style="color:${s.isSale?"#15803d":"#dc2626"};font-weight:${s.isSale?600:400}">${s.outcomeLabel}</span></div>`).join("")}
 </div>
 <div class="ft"><span>${storeName} · ${gD}</span><span>Sistema de Atendimento · ${gT}</span></div>
+</div></body></html>`;
+
+  const w=window.open("","_blank");
+  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
+}
+
+/* ══════════════════════════════════════════════════════
+   DASHBOARD PDF EXPORT
+══════════════════════════════════════════════════════ */
+function exportDashPDF(data, from, to, storeNames) {
+  const fmtD = iso => new Date(iso+"T00:00:00").toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric"});
+  const gT   = new Date().toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
+  const maxR = data.sortedReasons[0]?.[1]||1;
+  const maxSt= data.sortedStaff[0]?.sales||1;
+  const maxSt2=data.sortedStores[0]?.sales||1;
+
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Dashboard — ${storeNames.join(", ")}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',sans-serif;color:#111827;font-size:13px;line-height:1.5}
+.pg{max-width:900px;margin:0 auto;padding:44px}
+.rh{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:18px;border-bottom:3px solid #111827;margin-bottom:28px}
+.rh h1{font-size:24px;font-weight:800}.rh .sub{font-size:13px;color:#6b7280;margin-top:3px}
+.rh .mt{text-align:right;font-size:12px;color:#9ca3af;line-height:1.8}
+.rh .mt strong{color:#111827;font-size:14px;display:block;font-weight:700}
+.sc{margin-bottom:28px}.sc-t{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:#9ca3af;margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid #f3f4f6}
+.k4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.kp{border:1px solid #e5e7eb;border-radius:10px;padding:16px;background:#f9fafb;text-align:center}
+.kp.dk{background:#111827;border-color:#111827}.kp.gr{background:#f0fdf4;border-color:#bbf7d0}
+.kn{font-size:28px;font-weight:800;color:#111827;letter-spacing:-1px;line-height:1}
+.kp.dk .kn{color:#fff}.kp.gr .kn{color:#15803d}
+.kl{font-size:10px;color:#9ca3af;margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.bar-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.bar-label{flex:0 0 180px;font-size:12px;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-track{flex:1;height:10px;background:#f3f4f6;border-radius:5px;overflow:hidden}
+.bar-fill{height:100%;background:#e05c2d;border-radius:5px}
+.bar-fill.green{background:#16a34a}
+.bar-num{flex:0 0 28px;font-weight:700;font-size:12px;text-align:right}
+.bar-pct{flex:0 0 36px;font-size:11px;color:#9ca3af;text-align:right}
+.hc{display:flex;align-items:flex-end;gap:4px;height:80px;margin-bottom:6px}
+.hcl{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1}
+.hbw{flex:1;display:flex;align-items:flex-end;width:100%}
+.hb{width:100%;border-radius:3px 3px 0 0;min-height:2px}
+.hl{font-size:9px;color:#9ca3af;white-space:nowrap}.hct{font-size:9px;font-weight:700;color:#6b7280}
+table{width:100%;border-collapse:collapse}
+thead th{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#9ca3af;padding:7px 10px;text-align:left;border-bottom:1px solid #e5e7eb}
+tbody td{padding:8px 10px;border-bottom:1px solid #f3f4f6;vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+.tn{font-weight:600;color:#111827}.tg{color:#15803d;font-weight:600}.td{color:#9ca3af;font-size:12px}.tc{text-align:center}
+.mb{display:flex;align-items:center;gap:6px}.mb-t{flex:1;height:6px;background:#f3f4f6;border-radius:3px;overflow:hidden;min-width:60px}
+.mb-f{height:100%;border-radius:3px}.mb-l{font-size:11px;font-weight:700;width:32px;text-align:right}
+.ft{margin-top:36px;padding-top:12px;border-top:1px solid #e5e7eb;display:flex;justify-content:space-between;color:#d1d5db;font-size:11px}
+.nb{page-break-inside:avoid}
+@media print{.pg{padding:24px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body><div class="pg">
+
+<div class="rh">
+  <div>
+    <h1>📈 Dashboard de Atendimentos</h1>
+    <div class="sub">${storeNames.join(" · ")} · ${fmtD(from)} a ${fmtD(to)}</div>
+  </div>
+  <div class="mt"><strong>Período Selecionado</strong>${fmtD(from)} – ${fmtD(to)}<br>Gerado às ${gT}</div>
+</div>
+
+<div class="sc nb"><div class="sc-t">Resumo Geral</div>
+<div class="k4">
+<div class="kp"><div class="kn">${data.totalSvc}</div><div class="kl">Atendimentos</div></div>
+<div class="kp gr"><div class="kn">${data.totalSales}</div><div class="kl">Vendas</div></div>
+<div class="kp dk"><div class="kn" style="color:${data.conv>=60?"#86efac":data.conv>=40?"#fde68a":"#fca5a5"}">${data.conv}%</div><div class="kl">Conversão</div></div>
+<div class="kp"><div class="kn">${data.avgDur>0?data.avgDur+"'":"—"}</div><div class="kl">Tempo Médio</div></div>
+</div></div>
+
+${data.sortedStores.length>1?`
+<div class="sc nb"><div class="sc-t">Comparativo por Loja</div>
+<table><thead><tr><th>#</th><th>Loja</th><th class="tc">Atend.</th><th class="tc">Vendas</th><th style="min-width:120px">Conversão</th></tr></thead>
+<tbody>${data.sortedStores.map((s,i)=>{
+  const cc=s.conv>=60?"#16a34a":s.conv>=40?"#d97706":"#dc2626";
+  return `<tr><td class="td">${i+1}</td><td class="tn">${s.name}</td><td class="tc">${s.svc}</td><td class="tc tg">${s.sales}</td>
+  <td><div class="mb"><div class="mb-t"><div class="mb-f" style="width:${s.conv}%;background:${cc}"></div></div><span class="mb-l" style="color:${cc}">${s.conv}%</span></div></td></tr>`;
+}).join("")}</tbody></table></div>`:""}
+
+<div class="sc nb"><div class="sc-t">Movimento por Hora do Dia</div>
+<div class="hc">${data.sortedHour.map(([h,c])=>{
+  const ip=h===data.peakH?.[0]&&c>0;
+  const bh=data.maxHour>0?Math.max((c/data.maxHour)*68,c>0?3:0):0;
+  return `<div class="hcl"><div class="hct" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div class="hbw"><div class="hb" style="height:${bh}px;background:${ip?"#e05c2d":c>0?"#374151":"#f3f4f6'}"></div></div><div class="hl" style="color:${ip?"#e05c2d":"#9ca3af"}">${h}h</div></div>`;
+}).join("")}</div>
+${data.peakH&&data.peakH[1]>0?`<p style="font-size:11px;color:#9ca3af;margin-top:4px">🔥 Pico: ${data.peakH[0]}h com ${data.peakH[1]} atendimento${data.peakH[1]!==1?"s":""}</p>`:""}
+</div>
+
+${data.sortedReasons.length>0?`
+<div class="sc nb"><div class="sc-t">Motivos de Não Venda</div>
+${(()=>{
+  const total=data.sortedReasons.reduce((a,[,c])=>a+c,0);
+  return data.sortedReasons.map(([label,cnt])=>`
+<div class="bar-row">
+  <div class="bar-label">${label}</div>
+  <div class="bar-track"><div class="bar-fill" style="width:${Math.round((cnt/maxR)*100)}%"></div></div>
+  <div class="bar-num">${cnt}</div>
+  <div class="bar-pct">${Math.round((cnt/total)*100)}%</div>
+</div>`).join("");
+})()}</div>`:""}
+
+${data.sortedStaff.length>0?`
+<div class="sc nb"><div class="sc-t">Performance por Vendedora</div>
+<table><thead><tr><th>#</th><th>Vendedora</th>${data.sortedStores.length>1?"<th>Loja</th>":""}<th class="tc">Atend.</th><th class="tc">Vendas</th><th style="min-width:110px">Conversão</th></tr></thead>
+<tbody>${data.sortedStaff.map((p,i)=>{
+  const cc=p.conv>=60?"#16a34a":p.conv>=40?"#d97706":"#dc2626";
+  return `<tr><td class="td">${i===0?"★":i+1}</td><td class="tn">${p.name}</td>${data.sortedStores.length>1?`<td class="td">${p.store}</td>`:""}<td class="tc">${p.svc}</td><td class="tc tg">${p.sales}</td>
+  <td><div class="mb"><div class="mb-t"><div class="mb-f" style="width:${p.conv}%;background:${cc}"></div></div><span class="mb-l" style="color:${cc}">${p.conv}%</span></div></td></tr>`;
+}).join("")}</tbody></table></div>`:""}
+
+<div class="ft">
+  <span>Dashboard · ${storeNames.join(", ")} · ${fmtD(from)} a ${fmtD(to)}</span>
+  <span>Gerado às ${gT}</span>
+</div>
 </div></body></html>`;
 
   const w=window.open("","_blank");
