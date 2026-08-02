@@ -338,7 +338,8 @@ function StoreApp({store,onLogout}) {
   const [step,setStep]=useState("main");
   const [subD,setSubD]=useState("");
   const [showAdd,setShowAdd]=useState(false);
-  const [addName,setAddName]=useState("");
+  const [addPersonId,setAddPersonId]=useState("");
+  const [roster,setRoster]=useState([]);
   const [confEnd,setConfEnd]=useState(null);
   const [confClose,setConfClose]=useState(false);
   const [editSvc,setEditSvc]=useState(null);
@@ -348,6 +349,12 @@ function StoreApp({store,onLogout}) {
   const [ready,setReady]=useState(false);
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
+  useEffect(()=>{
+    const u=onSnapshot(storeRef(store.id),snap=>{
+      if(snap.exists())setRoster(snap.data().roster||[]);
+    });
+    return()=>u();
+  },[store.id]);
   useEffect(()=>{
     const u=onSnapshot(sessionRef(store.id),snap=>{
       if(snap.exists()){const d=snap.data();if(d.startedAt){setSession(d);setQueue(d.queue||[]);setServices(d.services||[]);}else{setSession(null);setQueue([]);setServices([]);}}
@@ -376,10 +383,11 @@ function StoreApp({store,onLogout}) {
   const tSvc=services.length,tSales=services.filter(s=>s.isSale).length;
   const conv=tSvc>0?Math.round((tSales/tSvc)*100):0;
 
+  const rosterAvail=()=>roster.filter(m=>!queue.some(p=>p.status!=="done"&&p.name===m.name));
   const addPerson=async()=>{
-    const name=addName.trim();if(!name)return;
-    const nq=[...queue,{id:uid(),name,status:"waiting",entryTime:new Date().toISOString(),breaks:[],exitTime:null,order:queue.filter(p=>p.status!=="done").length}];
-    setQueue(nq);await persist(nq,null,session?.startedAt||new Date().toISOString());setAddName("");setShowAdd(false);
+    const member=roster.find(m=>m.id===addPersonId);if(!member)return;
+    const nq=[...queue,{id:uid(),name:member.name,status:"waiting",entryTime:new Date().toISOString(),breaks:[],exitTime:null,order:queue.filter(p=>p.status!=="done").length}];
+    setQueue(nq);await persist(nq,null,session?.startedAt||new Date().toISOString());setAddPersonId("");setShowAdd(false);
   };
   const newCustomer=async()=>{
     const next=aq().find(p=>p.status==="waiting");if(!next||curSvc)return;
@@ -475,11 +483,19 @@ function StoreApp({store,onLogout}) {
         </div>
         <div style={{fontSize:18,fontWeight:600,color:VI.carvao,marginBottom:8}}>Pronta para começar</div>
         <div style={{fontSize:13,marginBottom:30,opacity:.7}}>O dia inicia com a primeira entrada.</div>
-        <Btn variant="accent" style={{display:"inline-flex",alignItems:"center",gap:7,padding:"12px 26px"}} onClick={()=>setShowAdd(true)}>
+        <Btn variant="accent" style={{display:"inline-flex",alignItems:"center",gap:7,padding:"12px 26px"}} onClick={()=>{setAddPersonId("");setShowAdd(true);}}>
           <Icon name="plus" size={14} color="#fff"/> Registrar primeira entrada
         </Btn>
       </div>
-      {showAdd&&<Modal onClose={()=>setShowAdd(false)}><MIcon name="user"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Registrar entrada</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Isso irá iniciar o dia de <strong>{store.name}</strong></p><Inp autoFocus value={addName} placeholder="Nome da funcionária" onChange={e=>setAddName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPerson()}/><div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn><Btn variant="accent" onClick={addPerson}>Iniciar o dia</Btn></div></Modal>}
+      {showAdd&&<Modal onClose={()=>setShowAdd(false)}><MIcon name="user"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Registrar entrada</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Isso irá iniciar o dia de <strong>{store.name}</strong></p>
+        {roster.length===0
+          ?<p style={{color:VI.muted,fontSize:13,textAlign:"center",padding:"8px 0 18px"}}>Nenhuma vendedora cadastrada.<br/><span style={{fontSize:12,opacity:.7}}>Peça ao administrador para cadastrar a equipe desta loja.</span></p>
+          :<select value={addPersonId} onChange={e=>setAddPersonId(e.target.value)} autoFocus
+              style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:addPersonId?VI.carvao:VI.muted}}>
+              <option value="">Selecione a vendedora</option>
+              {rosterAvail().map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>}
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn><Btn variant="accent" disabled={!addPersonId} onClick={addPerson}>Iniciar o dia</Btn></div></Modal>}
     </AppShell>
   );
 
@@ -492,7 +508,7 @@ function StoreApp({store,onLogout}) {
         {view==="queue"?<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("report")}><Icon name="chart" size={13} color={VI.muted}/>Relatório</Btn>
                        :<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("queue")}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}
         {view==="report"&&<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(store.name,queue,services,session?.startedAt)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn><Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar dia</Btn></>}
-        {view==="queue"&&<Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setShowAdd(true)}><Icon name="plus" size={13} color="#fff"/>Entrada</Btn>}
+        {view==="queue"&&<Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>{setAddPersonId("");setShowAdd(true);}}><Icon name="plus" size={13} color="#fff"/>Entrada</Btn>}
         <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,padding:"9px 10px"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
       </>}/>
     <StatsRow items={[{num:tSvc,label:"Atendimentos"},{num:tSales,label:"Vendas",color:VI.green},{num:`${conv}%`,label:"Conversão"},{num:aqArr.filter(p=>p.status==="waiting").length,label:"Na fila"}]}/>
@@ -539,7 +555,18 @@ function StoreApp({store,onLogout}) {
       <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv} onEdit={s=>{setEditSvc(s);setEditStep("main");setEditSubD("");}}/>
     </>}
 
-    {showAdd&&<Modal onClose={()=>setShowAdd(false)}><MIcon name="user"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Registrar entrada</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Adicionar à fila de atendimento</p><Inp autoFocus value={addName} placeholder="Nome da funcionária" onChange={e=>setAddName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPerson()}/><div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn><Btn variant="accent" onClick={addPerson}>Entrar na fila</Btn></div></Modal>}
+    {showAdd&&<Modal onClose={()=>setShowAdd(false)}><MIcon name="user"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Registrar entrada</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Adicionar à fila de atendimento</p>
+      {roster.length===0
+        ?<p style={{color:VI.muted,fontSize:13,textAlign:"center",padding:"8px 0 18px"}}>Nenhuma vendedora cadastrada.<br/><span style={{fontSize:12,opacity:.7}}>Peça ao administrador para cadastrar a equipe desta loja.</span></p>
+        :<>
+          <select value={addPersonId} onChange={e=>setAddPersonId(e.target.value)} autoFocus
+            style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:addPersonId?VI.carvao:VI.muted}}>
+            <option value="">Selecione a vendedora</option>
+            {rosterAvail().map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+          {rosterAvail().length===0&&<p style={{color:VI.muted,fontSize:12,marginTop:-6,marginBottom:12}}>Todas as vendedoras cadastradas já estão na fila hoje.</p>}
+        </>}
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn><Btn variant="accent" disabled={!addPersonId} onClick={addPerson}>Entrar na fila</Btn></div></Modal>}
 
     {curSvc&&<Modal closeable={false}><MIcon name="bell"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>{step==="main"?"Resultado do atendimento":"Motivo da não venda"}</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>{curSvc.salespersonName} · {fmtTime(curSvc.startTime)}</p>
       {step==="main"&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{MAIN_OUTCOMES.map(o=><button key={o.id} onClick={()=>o.id==="nao_vendeu"?setStep("sub"):finishSvc(o.id)} style={{background:o.isSale?VI.greenBg:VI.redBg,border:`1px solid ${o.color}44`,borderRadius:10,padding:"13px 16px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",fontFamily:"inherit"}}><span style={{fontSize:14,color:VI.carvao,fontWeight:500}}>{o.label}</span><Icon name={o.isSale?"check":"x"} size={16} color={o.color}/></button>)}</div>}
@@ -669,6 +696,8 @@ function AdminDashboard({onLogout}) {
   const [editSt,setEditSt]=useState(null);
   const [saving,setSaving]=useState(false);
   const [now,setNow]=useState(new Date());
+  const [teamStore,setTeamStore]=useState(null);
+  const [newMemberName,setNewMemberName]=useState("");
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
@@ -725,6 +754,29 @@ function AdminDashboard({onLogout}) {
   const addStore=async()=>{if(!newName.trim()||!newPin.trim())return;setSaving(true);await setDoc(storeRef(uid()),{name:newName.trim(),pin:newPin.trim(),active:true,createdAt:serverTimestamp()});setNewName("");setNewPin("");setShowAdd(false);setSaving(false);};
   const saveEdit=async()=>{if(!editSt)return;setSaving(true);await setDoc(storeRef(editSt.id),{name:editSt.name,pin:editSt.pin},{merge:true});setEditSt(null);setSaving(false);};
   const toggleActive=async s=>await setDoc(storeRef(s.id),{active:!s.active},{merge:true});
+
+  // Keep the open "Equipe" modal reflecting live Firestore data (roster edits
+  // from another tab/device, or our own writes coming back through onSnapshot).
+  useEffect(()=>{
+    setTeamStore(prev=>{
+      if(!prev)return prev;
+      return stores.find(s=>s.id===prev.id)||prev;
+    });
+  },[stores]);
+
+  const addMember=async()=>{
+    const name=newMemberName.trim();if(!name||!teamStore)return;
+    const roster=teamStore.roster||[];
+    if(roster.some(m=>m.name.toLowerCase()===name.toLowerCase()))return; // já cadastrada
+    const nr=[...roster,{id:uid(),name}];
+    await setDoc(storeRef(teamStore.id),{roster:nr},{merge:true});
+    setNewMemberName("");
+  };
+  const removeMember=async(id)=>{
+    if(!teamStore)return;
+    const nr=(teamStore.roster||[]).filter(m=>m.id!==id);
+    await setDoc(storeRef(teamStore.id),{roster:nr},{merge:true});
+  };
 
   const TABS=[{id:"overview",label:"Hoje",icon:"chart"},{id:"dashboard",label:"Dashboard",icon:"trend"},{id:"history",label:"Histórico",icon:"cal"},{id:"stores",label:"Lojas",icon:"store"}];
 
@@ -884,13 +936,41 @@ function AdminDashboard({onLogout}) {
             ?<div><div style={{display:"flex",gap:8,marginBottom:8}}><Inp value={editSt.name} style={{marginBottom:0,flex:1}} onChange={e=>setEditSt({...editSt,name:e.target.value})} placeholder="Nome"/><Inp value={editSt.pin} style={{marginBottom:0,width:95}} onChange={e=>setEditSt({...editSt,pin:e.target.value})} placeholder="PIN"/></div><div style={{display:"flex",gap:8}}><Btn variant="ghost" onClick={()=>setEditSt(null)}>Cancelar</Btn><Btn variant="accent" disabled={saving} onClick={saveEdit}>{saving?"Salvando…":"Salvar"}</Btn></div></div>
             :<div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div><div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div><div style={{fontSize:12,color:VI.muted,marginTop:2,display:"flex",alignItems:"center",gap:5}}>PIN: <code style={{background:VI.surfaceAlt,padding:"1px 7px",borderRadius:5,letterSpacing:"0.1em",border:`1px solid ${VI.border}`}}>{s.pin}</code>{s.active===false&&<span style={{color:VI.red}}>· Inativa</span>}</div></div>
-                <div style={{display:"flex",gap:5}}><Btn variant="sm" style={{display:"flex",alignItems:"center",gap:4}} onClick={()=>setEditSt({id:s.id,name:s.name,pin:s.pin})}><Icon name="edit" size={11} color={VI.muted}/>Editar</Btn><Btn variant="sm" style={{color:s.active===false?VI.green:VI.yellow}} onClick={()=>toggleActive(s)}>{s.active===false?"Ativar":"Pausar"}</Btn></div>
+                <div style={{display:"flex",gap:5}}><Btn variant="sm" style={{display:"flex",alignItems:"center",gap:4}} onClick={()=>setTeamStore(s)}><Icon name="users" size={11} color={VI.muted}/>Equipe{(s.roster||[]).length>0?` (${s.roster.length})`:""}</Btn><Btn variant="sm" style={{display:"flex",alignItems:"center",gap:4}} onClick={()=>setEditSt({id:s.id,name:s.name,pin:s.pin})}><Icon name="edit" size={11} color={VI.muted}/>Editar</Btn><Btn variant="sm" style={{color:s.active===false?VI.green:VI.yellow}} onClick={()=>toggleActive(s)}>{s.active===false?"Ativar":"Pausar"}</Btn></div>
               </div>}
         </div>
       ))}
     </div>}
 
     {showAdd&&<Modal onClose={()=>setShowAdd(false)}><MIcon name="store"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Nova loja</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Defina o nome e o PIN de acesso</p><Inp autoFocus value={newName} placeholder="Nome da loja" onChange={e=>setNewName(e.target.value)}/><Inp value={newPin} placeholder="PIN (ex: 1234)" onChange={e=>setNewPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addStore()}/><div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setShowAdd(false)}>Cancelar</Btn><Btn variant="accent" disabled={saving||!newName.trim()||!newPin.trim()} onClick={addStore}>{saving?"Salvando…":"Criar loja"}</Btn></div></Modal>}
+
+    {teamStore&&<Modal onClose={()=>{setTeamStore(null);setNewMemberName("");}}>
+      <MIcon name="users"/>
+      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Equipe — {teamStore.name}</h2>
+      <p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Cadastre as vendedoras que poderão ser selecionadas no registro diário desta loja</p>
+      <div style={{display:"flex",gap:8,marginBottom:16}}>
+        <Inp style={{marginBottom:0,flex:1}} value={newMemberName} placeholder="Nome da vendedora"
+          onChange={e=>setNewMemberName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addMember()}/>
+        <Btn variant="accent" style={{flexShrink:0,display:"flex",alignItems:"center",gap:5}} onClick={addMember}>
+          <Icon name="plus" size={13} color="#fff"/>Adicionar
+        </Btn>
+      </div>
+      <div style={{maxHeight:280,overflowY:"auto"}}>
+        {(teamStore.roster||[]).length===0&&<p style={{color:VI.muted,fontSize:13,textAlign:"center",padding:"10px 0"}}>Nenhuma vendedora cadastrada</p>}
+        {(teamStore.roster||[]).map(m=>(
+          <div key={m.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${VI.border}`}}>
+            <span style={{fontSize:14,color:VI.carvao}}>{m.name}</span>
+            <button onClick={()=>removeMember(m.id)}
+              style={{background:"none",border:`1px solid ${VI.border}`,borderRadius:6,padding:"4px 9px",color:VI.red,fontSize:11,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
+              <Icon name="x" size={10} color={VI.red}/>Remover
+            </button>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginTop:18}}>
+        <Btn variant="ghost" onClick={()=>{setTeamStore(null);setNewMemberName("");}}>Fechar</Btn>
+      </div>
+    </Modal>}
   </AppShell>);
 }
 function exportPDF(storeName,queue,services,startedAt){
