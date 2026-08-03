@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   doc, collection, onSnapshot, setDoc, getDoc,
-  getDocs, serverTimestamp, query, orderBy,
+  getDocs, serverTimestamp, query, orderBy, where,
 } from "firebase/firestore";
 import { db } from "./firebase.js";
 
@@ -54,6 +54,216 @@ const supervisaoRef = () => doc(db,"config","supervisao");
 const historyCol = id => collection(db,"history",id,"days");
 const histDayRef = (s,d) => doc(db,"history",s,"days",d);
 const demandsRef = id => doc(db,"demands",id);
+const reservationsCol = () => collection(db,"reservations");
+const reservationRef = id => doc(db,"reservations",id);
+const customerRef = phone => doc(db,"customers",phone);
+
+// ──────────────────────────────────────────
+// Reservas de clientes — produto separado para retorno posterior, a partir
+// do motivo "Reservou para outro dia" no fluxo de não-venda. Um documento
+// por reserva (não por loja): precisa ser buscável globalmente por telefone,
+// código e produto, e sobrevive a vários fechamentos de dia.
+// ──────────────────────────────────────────
+const RESERVATION_STATUS = {
+  ATIVA:              { label:"Ativa",               color:"#2563eb", bg:"#EAF1FE" },
+  AGUARDANDO_RETORNO: { label:"Aguardando retorno",   color:"#2563eb", bg:"#EAF1FE" },
+  VENCE_HOJE:         { label:"Vence hoje",           color:VI.yellow, bg:VI.yellowBg },
+  VENCIDA:            { label:"Vencida",              color:VI.red,    bg:VI.redBg },
+  RETORNOU:           { label:"Cliente retornou",     color:VI.terra,  bg:`${VI.blush}40` },
+  CONVERTIDA:         { label:"Convertida em venda",  color:VI.green,  bg:VI.greenBg },
+  PARCIAL:            { label:"Parcialmente vendida", color:"#C9762C", bg:"#FCEEE0" },
+  CANCELADA:          { label:"Cancelada",            color:VI.muted,  bg:VI.surfaceAlt },
+  PERDIDA:            { label:"Perdida",              color:VI.red,    bg:VI.redBg },
+};
+const RESERVATION_OPEN_STATUSES = ["ATIVA","AGUARDANDO_RETORNO","VENCE_HOJE","VENCIDA","RETORNOU"];
+const LOSS_REASONS = [
+  "Não gostou do produto","Tamanho ou caimento","Preço","Desistiu da compra",
+  "Escolheu outro produto, mas não concluiu","Produto não estava disponível",
+  "Reserva não foi encontrada","Atendimento","Outro",
+];
+const CANCEL_REASONS = [
+  "Cliente desistiu","Não retornou","Não respondeu","Comprou em outro local",
+  "Prazo venceu","Produto precisou ser liberado","Cadastro duplicado","Erro de cadastro","Outro",
+];
+const CONTACT_TYPES = [
+  { id:"whatsapp_enviado",   label:"WhatsApp enviado" },
+  { id:"ligacao",            label:"Ligação realizada" },
+  { id:"cliente_respondeu",  label:"Cliente respondeu" },
+  { id:"cliente_confirmou",  label:"Cliente confirmou retorno" },
+  { id:"pediu_extensao",     label:"Cliente pediu extensão" },
+  { id:"sem_resposta",       label:"Sem resposta" },
+  { id:"outro",              label:"Outro" },
+];
+const DEFAULT_RESERVATION_DAYS = 3; // prazo padrão quando a loja não tem configuração própria
+
+const normalizePhone = (raw="") => raw.replace(/\D/g,"");
+const maskPhone = (raw="") => {
+  const d=normalizePhone(raw).slice(0,11);
+  if(d.length<=2) return d;
+  if(d.length<=6) return `(${d.slice(0,2)}) ${d.slice(2)}`;
+  if(d.length<=10) return `(${d.slice(0,2)}) ${d.slice(2,6)}-${d.slice(6)}`;
+  return `(${d.slice(0,2)}) ${d.slice(2,7)}-${d.slice(7,11)}`;
+};
+const genReservationCode = () => `RES-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).slice(2,4).toUpperCase()}`;
+
+// Status "ao vivo": Vencida/Vence hoje são calculados na hora, não persistidos —
+// evita gravações concorrentes só por causa da passagem do tempo. Status finais
+// (convertida, cancelada, perdida, parcial, retornou) nunca são sobrescritos aqui.
+const liveReservationStatus = (r, now=new Date()) => {
+  if(!RESERVATION_OPEN_STATUSES.includes(r.status) || r.status==="RETORNOU") return r.status;
+  const exp=new Date(r.expiresAt);
+  if(exp<now) return "VENCIDA";
+  if(exp.toDateString()===now.toDateString()) return "VENCE_HOJE";
+  return r.status==="AGUARDANDO_RETORNO"?"AGUARDANDO_RETORNO":"ATIVA";
+};
+const reservationTotals = (items=[]) => ({
+  totalPieces: items.reduce((a,it)=>a+(Number(it.reservedQuantity)||0),0),
+  estimatedTotal: items.reduce((a,it)=>a+(Number(it.finalUnitPrice)||0)*(Number(it.reservedQuantity)||0),0),
+});
+
+// Cria a reserva (a partir do fluxo "Reservou para outro dia" ou avulsa pela
+// central) e o registro de cliente (dedupe por telefone normalizado).
+async function createReservation({
+  storeId, storeName, sellerName, originalServiceId=null,
+  customerName, customerPhone, contactAuthorized=false, preferredContact="whatsapp",
+  customerNeed="", notes="", items, expectedReturnAt, expiresAt, createdBy,
+}){
+  const normalized=normalizePhone(customerPhone);
+  const now=new Date().toISOString();
+  const itemsCalc=items.map(it=>{
+    const unitPrice=Number(it.unitPrice)||0, discount=Number(it.discount)||0;
+    return{
+      id:uid(), sku:(it.sku||"").trim(), productName:it.productName.trim(), brand:(it.brand||"").trim(),
+      color:(it.color||"").trim(), size:(it.size||"").trim(), reservedQuantity:Math.max(1,Number(it.qty)||1),
+      remainingQuantity:Math.max(1,Number(it.qty)||1), unitPrice, expectedDiscount:discount,
+      finalUnitPrice:Math.max(0,unitPrice-discount), itemStatus:"RESERVADO", notes:(it.notes||"").trim(),
+    };
+  });
+  const{totalPieces,estimatedTotal}=reservationTotals(itemsCalc);
+  const reservation={
+    id:uid(), reservationCode:genReservationCode(),
+    originalServiceId, storeId, storeName, originalSellerName:sellerName, currentResponsibleName:sellerName,
+    customerName:customerName.trim(), customerPhone:maskPhone(normalized), normalizedPhone:normalized,
+    contactAuthorized, preferredContact, customerNeed, notes,
+    items:itemsCalc, totalPieces, estimatedTotal, convertedTotal:0, soldItemsQuantity:0,
+    status:"ATIVA", expectedReturnAt, expiresAt,
+    createdBy, createdAt:now, updatedAt:now, cancelledAt:null, cancellationReason:null,
+    contacts:[], conversions:[],
+    history:[{id:uid(), action:"CRIADA", previousStatus:null, newStatus:"ATIVA", justification:"", createdBy, createdAt:now}],
+  };
+  await setDoc(reservationRef(reservation.id), reservation);
+  await setDoc(customerRef(normalized), {name:customerName.trim(), phone:maskPhone(normalized), normalizedPhone:normalized, whatsappAuthorized:contactAuthorized, updatedAt:serverTimestamp()}, {merge:true});
+  return reservation;
+}
+
+// Checa reservas ativas do mesmo telefone antes de salvar (aviso, não bloqueio).
+async function findActiveReservationsByPhone(phone){
+  const normalized=normalizePhone(phone);
+  if(normalized.length<8) return [];
+  const snap=await getDocs(query(reservationsCol(), orderBy("createdAt","desc")));
+  return snap.docs.map(d=>d.data()).filter(r=>r.normalizedPhone===normalized&&RESERVATION_OPEN_STATUSES.includes(liveReservationStatus(r)));
+}
+
+async function addReservationContact(reservationId,{type,result="",notes="",nextActionAt=null,createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return;
+  const r=snap.data();
+  const contact={id:uid(),type,result,notes,nextActionAt,createdBy,createdAt:new Date().toISOString()};
+  await setDoc(reservationRef(reservationId),{contacts:[...(r.contacts||[]),contact],updatedAt:new Date().toISOString()},{merge:true});
+}
+
+async function extendReservationDeadline(reservationId,{newExpiresAt,justification,createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return;
+  const r=snap.data();
+  const now=new Date().toISOString();
+  const hist={id:uid(),action:"PRORROGACAO",previousStatus:r.status,newStatus:r.status,previousData:{expiresAt:r.expiresAt},newData:{expiresAt:newExpiresAt},justification,createdBy,createdAt:now};
+  await setDoc(reservationRef(reservationId),{expiresAt:newExpiresAt,status:r.status==="VENCIDA"?"ATIVA":r.status,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+
+async function reassignReservationResponsible(reservationId,{newResponsibleName,justification,createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return;
+  const r=snap.data();
+  const now=new Date().toISOString();
+  const hist={id:uid(),action:"REATRIBUICAO",previousStatus:r.status,newStatus:r.status,previousData:{responsible:r.currentResponsibleName},newData:{responsible:newResponsibleName},justification,createdBy,createdAt:now};
+  await setDoc(reservationRef(reservationId),{currentResponsibleName:newResponsibleName,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+
+async function markReservationReturnedNoSale(reservationId,{reason,notes="",createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return;
+  const r=snap.data();
+  const now=new Date().toISOString();
+  const hist={id:uid(),action:"RETORNOU_SEM_COMPRA",previousStatus:r.status,newStatus:"PERDIDA",justification:reason,createdBy,createdAt:now};
+  await setDoc(reservationRef(reservationId),{status:"PERDIDA",cancelledAt:now,cancellationReason:reason,notes:notes?`${r.notes||""}\n${notes}`.trim():r.notes,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+
+async function cancelOrLoseReservation(reservationId,{outcome,reason,notes="",createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return;
+  const r=snap.data();
+  const now=new Date().toISOString();
+  const hist={id:uid(),action:outcome,previousStatus:r.status,newStatus:outcome,justification:reason,createdBy,createdAt:now};
+  await setDoc(reservationRef(reservationId),{status:outcome,cancelledAt:now,cancellationReason:reason,notes:notes?`${r.notes||""}\n${notes}`.trim():r.notes,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+
+// Conversão integral — impede uma segunda conversão total (status já CONVERTIDA).
+async function convertReservationFull(reservationId,{sellerName,storeId,saleReference="",notes="",createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return null;
+  const r=snap.data();
+  if(r.status==="CONVERTIDA") return null;
+  const now=new Date().toISOString();
+  const items=(r.items||[]).map(it=>({...it,remainingQuantity:0,itemStatus:"VENDIDO"}));
+  const soldQty=items.reduce((a,it)=>a+it.reservedQuantity,0);
+  const totalSaleValue=items.reduce((a,it)=>a+it.finalUnitPrice*it.reservedQuantity,0);
+  const conversion={
+    id:uid(), sellerName, storeId, convertedAt:now, saleReference,
+    reservedItemsValue:totalSaleValue, additionalItemsValue:0, totalSaleValue,
+    reservedItemsQuantity:soldQty, additionalItemsQuantity:0, conversionType:"INTEGRAL",
+    notes, createdBy, items:items.map(it=>({sku:it.sku,productName:it.productName,qty:it.reservedQuantity,finalPrice:it.finalUnitPrice})),
+  };
+  const hist={id:uid(),action:"CONVERTIDA",previousStatus:r.status,newStatus:"CONVERTIDA",justification:"",createdBy,createdAt:now};
+  await setDoc(reservationRef(reservationId),{
+    items, status:"CONVERTIDA", convertedTotal:(r.convertedTotal||0)+totalSaleValue, soldItemsQuantity:(r.soldItemsQuantity||0)+soldQty,
+    conversions:[...(r.conversions||[]),conversion], history:[...(r.history||[]),hist], updatedAt:now,
+  },{merge:true});
+  return conversion;
+}
+
+// Venda parcial — vende só parte do saldo; o restante some (se a cliente não quer
+// mais) ou permanece reservado (novo saldo, ainda convertível depois).
+async function convertReservationPartial(reservationId,{soldItems,sellerName,storeId,saleReference="",notes="",keepRemaining,createdBy}){
+  const snap=await getDoc(reservationRef(reservationId)); if(!snap.exists())return null;
+  const r=snap.data();
+  const now=new Date().toISOString();
+  let reservedItemsValue=0, reservedItemsQty=0;
+  const items=(r.items||[]).map(it=>{
+    const sold=soldItems.find(s=>s.itemId===it.id);
+    if(!sold) return it;
+    const qty=Math.min(Math.max(0,Number(sold.qtySold)||0), it.remainingQuantity);
+    if(qty<=0) return it;
+    const finalPrice=Number(sold.finalPrice)||it.finalUnitPrice;
+    reservedItemsValue+=qty*finalPrice; reservedItemsQty+=qty;
+    const remaining=it.remainingQuantity-qty;
+    return{...it, remainingQuantity:keepRemaining?remaining:0, itemStatus:remaining<=0?"VENDIDO":(keepRemaining?"PARCIAL":"ENCERRADO")};
+  });
+  const allSold=items.every(it=>it.remainingQuantity<=0);
+  const conversion={
+    id:uid(), sellerName, storeId, convertedAt:now, saleReference,
+    reservedItemsValue, additionalItemsValue:0, totalSaleValue:reservedItemsValue,
+    reservedItemsQuantity:reservedItemsQty, additionalItemsQuantity:0, conversionType:"PARCIAL",
+    notes, createdBy, items:soldItems,
+  };
+  const hist={id:uid(),action:allSold?"CONVERTIDA":"VENDA_PARCIAL",previousStatus:r.status,newStatus:allSold?"CONVERTIDA":"PARCIAL",justification:"",createdBy,createdAt:now};
+  await setDoc(reservationRef(reservationId),{
+    items, status:allSold?"CONVERTIDA":"PARCIAL",
+    convertedTotal:(r.convertedTotal||0)+reservedItemsValue, soldItemsQuantity:(r.soldItemsQuantity||0)+reservedItemsQty,
+    conversions:[...(r.conversions||[]),conversion], history:[...(r.history||[]),hist], updatedAt:now,
+  },{merge:true});
+  return conversion;
+}
+
+const waMessage = (r) => {
+  const items=(r.items||[]).map(it=>`${it.reservedQuantity}x ${it.productName}${it.size?` (${it.size})`:""}`).join(", ");
+  const prazo=r.expiresAt?new Date(r.expiresAt).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):"";
+  return `Olá, ${r.customerName}! Aqui é ${r.currentResponsibleName}, da Via Íntima ${r.storeName}. Conforme combinamos, deixamos reservados para você: ${items}. Sua reserva ficará disponível até ${prazo}. Se precisar, pode falar com a gente por aqui.`;
+};
 
 // ──────────────────────────────────────────
 // Tarefas com SLA — checklist de abertura/fechamento + demandas avulsas
@@ -166,6 +376,12 @@ const Icon = ({ name, size=16, color="currentColor", sw=1.5 }) => {
     trend:   <><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></>,
     star:    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>,
     list:    <><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></>,
+    bookmark:<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>,
+    phone:   <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.362 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.338 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>,
+    tag:     <><path d="M20.59 13.41L13.42 20.6a2 2 0 0 1-2.83 0L2.5 12.5V2h10.5l7.6 7.6a2 2 0 0 1 0 2.83z"/><circle cx="7" cy="7" r="1.5"/></>,
+    copy:    <><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></>,
+    search:  <><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></>,
+    package: <><path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></>,
   };
   return (
     <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24"
@@ -474,6 +690,19 @@ function StoreApp({store,onLogout}) {
   const [taskNote,setTaskNote]=useState("");
   const [taskWho,setTaskWho]=useState("");
   const [taskBonus,setTaskBonus]=useState({ABERTURA:false,FECHAMENTO:false});
+  const [reservations,setReservations]=useState([]);
+  const [reservationsReady,setReservationsReady]=useState(false);
+  const [resSearch,setResSearch]=useState("");
+  const [resStatusFilter,setResStatusFilter]=useState("");
+  const [resDetail,setResDetail]=useState(null);
+  const [resDraft,setResDraft]=useState(null);
+  const [resSavedInfo,setResSavedInfo]=useState(null);
+  const [resPhoneWarning,setResPhoneWarning]=useState([]);
+  const [resSaving,setResSaving]=useState(false);
+  const [resContactType,setResContactType]=useState("");
+  const [resContactNotes,setResContactNotes]=useState("");
+  const [resActionModal,setResActionModal]=useState(null); // "convert" | "partial" | "returned" | "cancel" | "lose" | "extend"
+  const [resActionState,setResActionState]=useState({});
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{
@@ -486,6 +715,13 @@ function StoreApp({store,onLogout}) {
     const u=onSnapshot(demandsRef(store.id),snap=>{
       setDemands(snap.exists()?(snap.data().items||[]):[]);
       setDemandsReady(true);
+    });
+    return()=>u();
+  },[store.id]);
+  useEffect(()=>{
+    const u=onSnapshot(query(reservationsCol(),where("storeId","==",store.id)),snap=>{
+      setReservations(snap.docs.map(d=>d.data()).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)));
+      setReservationsReady(true);
     });
     return()=>u();
   },[store.id]);
@@ -597,10 +833,101 @@ function StoreApp({store,onLogout}) {
   const finishSvc=async(oId,detail="")=>{
     if(!curSvc)return;
     const{label,isSale}=resolve(oId,detail);
-    const ns=[...services,{...curSvc,endTime:new Date().toISOString(),outcome:oId,outcomeLabel:label,isSale,detail}];
+    const finishedSvc={...curSvc,endTime:new Date().toISOString(),outcome:oId,outcomeLabel:label,isSale,detail};
+    const ns=[...services,finishedSvc];
     const mo=Math.max(...queue.filter(q=>q.status!=="done").map(q=>q.order),0);
     const nq=queue.map(p=>p.id===curSvc.salespersonId?{...p,status:"waiting",order:mo+1}:p);
     setQueue(nq);setServices(ns);setCurSvc(null);setStep("main");setSubD("");await persist(nq,ns);
+    // O atendimento continua registrado como não-venda no dia de hoje; a
+    // reserva é um registro à parte, ligada a ele por originalServiceId.
+    if(oId==="reservou")openNewReservation(finishedSvc);
+  };
+
+  // ── Reservas de clientes ──────────────────────────────────────
+  const blankResItem=()=>({sku:"",productName:"",brand:"",color:"",size:"",qty:1,unitPrice:"",discount:"",notes:""});
+  const openNewReservation=(originalSvc=null)=>{
+    const def=new Date(Date.now()+DEFAULT_RESERVATION_DAYS*86400000);
+    const defStr=`${def.getFullYear()}-${String(def.getMonth()+1).padStart(2,"0")}-${String(def.getDate()).padStart(2,"0")}T${String(def.getHours()).padStart(2,"0")}:${String(def.getMinutes()).padStart(2,"0")}`;
+    setResDraft({
+      originalServiceId:originalSvc?.id||null,
+      sellerName:originalSvc?.salespersonName||"",
+      customerName:"",customerPhone:"",contactAuthorized:false,preferredContact:"whatsapp",
+      customerNeed:"",notes:"",items:[blankResItem()],
+      expectedReturnAt:defStr,expiresAt:defStr,
+    });
+    setResSavedInfo(null);setResPhoneWarning([]);setView("newReservation");
+  };
+  const updateResDraft=(field,val)=>setResDraft(d=>({...d,[field]:val}));
+  const updateResItem=(i,field,val)=>setResDraft(d=>({...d,items:d.items.map((it,idx)=>idx===i?{...it,[field]:val}:it)}));
+  const addResItem=()=>setResDraft(d=>({...d,items:[...d.items,blankResItem()]}));
+  const removeResItem=(i)=>setResDraft(d=>({...d,items:d.items.length>1?d.items.filter((_,idx)=>idx!==i):d.items}));
+  const checkResPhone=async()=>{
+    if(!resDraft?.customerPhone)return;
+    const found=await findActiveReservationsByPhone(resDraft.customerPhone);
+    setResPhoneWarning(found.filter(r=>r.originalServiceId!==resDraft.originalServiceId));
+  };
+  const resDraftValid=()=>resDraft&&resDraft.customerName.trim()&&normalizePhone(resDraft.customerPhone).length>=10
+    &&resDraft.sellerName&&resDraft.expectedReturnAt&&resDraft.expiresAt
+    &&resDraft.items.some(it=>it.productName.trim());
+  const saveReservation=async()=>{
+    if(!resDraftValid()||resSaving)return;
+    setResSaving(true);
+    const validItems=resDraft.items.filter(it=>it.productName.trim());
+    try{
+      const saved=await createReservation({
+        storeId:store.id,storeName:store.name,sellerName:resDraft.sellerName,originalServiceId:resDraft.originalServiceId,
+        customerName:resDraft.customerName,customerPhone:resDraft.customerPhone,contactAuthorized:resDraft.contactAuthorized,
+        preferredContact:resDraft.preferredContact,customerNeed:resDraft.customerNeed,notes:resDraft.notes,
+        items:validItems,expectedReturnAt:new Date(resDraft.expectedReturnAt).toISOString(),expiresAt:new Date(resDraft.expiresAt).toISOString(),
+        createdBy:resDraft.sellerName,
+      });
+      setResSavedInfo(saved);
+    }finally{setResSaving(false);}
+  };
+  const openResDetail=(r)=>{setResDetail(r);setView("reservationDetail");};
+  const liveResDetail=()=>resDetail?(reservations.find(r=>r.id===resDetail.id)||resDetail):null;
+
+  const openResAction=(kind,init={})=>{setResActionModal(kind);setResActionState(init);};
+  const closeResAction=()=>{setResActionModal(null);setResActionState({});};
+
+  const submitRegistrarContato=async()=>{
+    const r=liveResDetail();if(!r||!resActionState.type)return;
+    await addReservationContact(r.id,{type:resActionState.type,notes:resActionState.notes||"",createdBy:currentSeller()});
+    closeResAction();
+  };
+  const submitProrrogar=async()=>{
+    const r=liveResDetail();if(!r||!resActionState.newExpiresAt||!resActionState.justification)return;
+    await extendReservationDeadline(r.id,{newExpiresAt:new Date(resActionState.newExpiresAt).toISOString(),justification:resActionState.justification,createdBy:currentSeller()});
+    closeResAction();
+  };
+  const submitRetornouSemCompra=async()=>{
+    const r=liveResDetail();if(!r||!resActionState.reason)return;
+    await markReservationReturnedNoSale(r.id,{reason:resActionState.reason,notes:resActionState.notes||"",createdBy:currentSeller()});
+    closeResAction();
+  };
+  const submitCancelarPerder=async(outcome)=>{
+    const r=liveResDetail();if(!r||!resActionState.reason)return;
+    await cancelOrLoseReservation(r.id,{outcome,reason:resActionState.reason,notes:resActionState.notes||"",createdBy:currentSeller()});
+    closeResAction();
+  };
+  const submitConverterIntegral=async()=>{
+    const r=liveResDetail();if(!r)return;
+    await convertReservationFull(r.id,{sellerName:resActionState.sellerName||currentSeller(),storeId:store.id,saleReference:resActionState.saleReference||"",notes:resActionState.notes||"",createdBy:currentSeller()});
+    closeResAction();
+  };
+  const submitVendaParcial=async()=>{
+    const r=liveResDetail();if(!r)return;
+    const soldItems=(resActionState.items||[]).filter(it=>Number(it.qtySold)>0).map(it=>({itemId:it.itemId,qtySold:Number(it.qtySold),finalPrice:Number(it.finalPrice)}));
+    if(soldItems.length===0)return;
+    await convertReservationPartial(r.id,{soldItems,sellerName:resActionState.sellerName||currentSeller(),storeId:store.id,saleReference:resActionState.saleReference||"",notes:resActionState.notes||"",keepRemaining:!!resActionState.keepRemaining,createdBy:currentSeller()});
+    closeResAction();
+  };
+  const currentSeller=()=>resActionState.sellerName||liveResDetail()?.currentResponsibleName||roster[0]?.name||"Loja";
+
+  const editSvcFn=async(id,oId,detail="")=>{
+    const{label,isSale}=resolve(oId,detail);
+    const ns=services.map(s=>s.id===id?{...s,outcome:oId,outcomeLabel:label,isSale,detail}:s);
+    setServices(ns);setEditSvc(null);setEditStep("main");setEditSubD("");await persist(null,ns);
   };
   const editSvcFn=async(id,oId,detail="")=>{
     const{label,isSale}=resolve(oId,detail);
@@ -704,6 +1031,35 @@ function StoreApp({store,onLogout}) {
   const nextTask=taskGroups.pendentes[0]||null;
   const pointsToday=demands.reduce((s,d)=>s+(d.pointsAwarded||0),0);
 
+  const resLive=reservations.map(r=>({...r,liveStatus:liveReservationStatus(r,now)}));
+  const resCounts={
+    ativas:resLive.filter(r=>RESERVATION_OPEN_STATUSES.includes(r.liveStatus)).length,
+    venceHoje:resLive.filter(r=>r.liveStatus==="VENCE_HOJE").length,
+    vencidas:resLive.filter(r=>r.liveStatus==="VENCIDA").length,
+  };
+
+  if(view==="reservations")return(<ReservationsCentral
+    reservations={resLive} search={resSearch} setSearch={setResSearch}
+    statusFilter={resStatusFilter} setStatusFilter={setResStatusFilter}
+    onBack={()=>setView("queue")} onOpen={openResDetail} onNew={()=>openNewReservation(null)}/>);
+
+  if(view==="newReservation")return(<NewReservationForm
+    draft={resDraft} onChange={updateResDraft} onUpdateItem={updateResItem} onAddItem={addResItem} onRemoveItem={removeResItem}
+    roster={roster} phoneWarning={resPhoneWarning} onCheckPhone={checkResPhone}
+    saving={resSaving} valid={resDraftValid()} onSave={saveReservation}
+    savedInfo={resSavedInfo} onOpenSaved={()=>openResDetail(resSavedInfo)}
+    onNewAnother={()=>openNewReservation(null)} onBack={()=>setView(resDraft?.originalServiceId?"queue":"reservations")}/>);
+
+  if(view==="reservationDetail"){
+    const r=liveResDetail();
+    if(!r)return(<AppShell><Topbar title="Reserva" actions={<Btn variant="ghost" onClick={()=>setView("reservations")}><Icon name="back" size={13} color={VI.muted}/>Reservas</Btn>}/><div style={{padding:40,textAlign:"center",color:VI.muted}}>Reserva não encontrada.</div></AppShell>);
+    return(<ReservationDetail reservation={r} roster={roster} now={now} onBack={()=>setView("reservations")}
+      actionModal={resActionModal} actionState={resActionState} openAction={openResAction} closeAction={closeResAction} setActionState={setResActionState}
+      onRegistrarContato={submitRegistrarContato} onProrrogar={submitProrrogar} onRetornouSemCompra={submitRetornouSemCompra}
+      onCancelar={()=>submitCancelarPerder("CANCELADA")} onPerder={()=>submitCancelarPerder("PERDIDA")}
+      onConverterIntegral={submitConverterIntegral} onVendaParcial={submitVendaParcial} storeName={store.name}/>);
+  }
+
   return(<AppShell>
     <Topbar title={store.name}
       sub={<><span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>{subSuffix(now)}</>}
@@ -711,6 +1067,7 @@ function StoreApp({store,onLogout}) {
         {view!=="queue"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("queue")}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}
         {view!=="report"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("report")}><Icon name="chart" size={13} color={VI.muted}/>Relatório</Btn>}
         {view!=="tasks"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(taskGroups.atrasadas.length?{borderColor:VI.red,color:VI.red}:{})}} onClick={()=>setView("tasks")}><Icon name="list" size={13} color={taskGroups.atrasadas.length?VI.red:VI.muted}/>Tarefas{taskGroups.atrasadas.length>0?` (${taskGroups.atrasadas.length})`:""}</Btn>}
+        <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(resCounts.vencidas?{borderColor:VI.red,color:VI.red}:{})}} onClick={()=>setView("reservations")}><Icon name="bookmark" size={13} color={resCounts.vencidas?VI.red:VI.muted}/>Reservas{resCounts.ativas>0?` (${resCounts.ativas})`:""}</Btn>
         {view==="report"&&<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(store.name,queue,services,session?.startedAt,demands)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn><Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar dia</Btn></>}
         {view==="queue"&&<Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>{setAddPersonId("");setShowAdd(true);}}><Icon name="plus" size={13} color="#fff"/>Entrada</Btn>}
         <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,padding:"9px 10px"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
@@ -1009,6 +1366,319 @@ function TaskCard({demand,now,onClick}) {
       </div>
     </div>
   );
+}
+
+// ── Reservas — Central, Novo formulário e Detalhe ──────────────────
+function ResBadge({status}){
+  const m=RESERVATION_STATUS[status]||RESERVATION_STATUS.ATIVA;
+  return <span style={{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:5,background:m.bg,color:m.color,whiteSpace:"nowrap"}}>{m.label}</span>;
+}
+const maskPhoneDisplay=(phone,hide)=>{
+  if(!hide)return phone;
+  const d=normalizePhone(phone);
+  if(d.length<6)return phone;
+  return `(${d.slice(0,2)}) ${d.slice(2,4)}***-**${d.slice(-2)}`;
+};
+
+function ReservationsCentral({reservations,search,setSearch,statusFilter,setStatusFilter,onBack,onOpen,onNew}){
+  const q=search.trim().toLowerCase();
+  const filtered=reservations.filter(r=>{
+    if(statusFilter&&r.liveStatus!==statusFilter)return false;
+    if(!q)return true;
+    const hay=[r.customerName,r.customerPhone,r.normalizedPhone,r.reservationCode,...(r.items||[]).map(it=>`${it.productName} ${it.sku}`)].join(" ").toLowerCase();
+    return hay.includes(q);
+  });
+  const c={
+    venceHoje:reservations.filter(r=>r.liveStatus==="VENCE_HOJE").length,
+    vencidas:reservations.filter(r=>r.liveStatus==="VENCIDA").length,
+    convertidas:reservations.filter(r=>r.liveStatus==="CONVERTIDA").length,
+  };
+  const chips=[{label:"Todas",val:""},{label:`Vence hoje (${c.venceHoje})`,val:"VENCE_HOJE"},{label:`Vencidas (${c.vencidas})`,val:"VENCIDA"},{label:`Convertidas (${c.convertidas})`,val:"CONVERTIDA"}];
+  return(<AppShell>
+    <Topbar title="Reservas" sub={`${reservations.length} reserva${reservations.length!==1?"s":""}`}
+      actions={<>
+        <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={onBack}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>
+        <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={onNew}><Icon name="plus" size={13} color="#fff"/>Nova reserva</Btn>
+      </>}/>
+    <div style={{padding:"14px 22px 0"}}>
+      <Inp value={search} onChange={e=>setSearch(e.target.value)} placeholder="Buscar por cliente, telefone, código ou produto…" style={{marginBottom:10}}/>
+      <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14}}>
+        {chips.map(ch=>{const sel=statusFilter===ch.val;return(
+          <button key={ch.label} onClick={()=>setStatusFilter(ch.val)} style={{background:sel?`${VI.terra}18`:"transparent",border:`1px solid ${sel?VI.terra:VI.border}`,borderRadius:20,padding:"5px 12px",color:sel?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:sel?600:400}}>{ch.label}</button>
+        );})}
+      </div>
+    </div>
+    <div style={{padding:"0 22px 40px"}}>
+      {filtered.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="bookmark" size={30} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma reserva encontrada.</p></div>}
+      {filtered.map(r=>{
+        const totalItems=(r.items||[]).reduce((a,it)=>a+it.reservedQuantity,0);
+        return(<div key={r.id} onClick={()=>onOpen(r)}
+          style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:7,cursor:"pointer",transition:"border-color .2s"}}
+          onMouseEnter={e=>e.currentTarget.style.borderColor=VI.terra} onMouseLeave={e=>e.currentTarget.style.borderColor=VI.border}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
+            <div style={{minWidth:0}}>
+              <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{r.customerName}</div>
+              <div style={{fontSize:11,color:VI.muted,marginTop:1}}>{r.reservationCode} · {r.customerPhone}</div>
+            </div>
+            <ResBadge status={r.liveStatus}/>
+          </div>
+          <div style={{fontSize:12,color:VI.muted,marginBottom:6}}>{totalItems} peça{totalItems!==1?"s":""} · {(r.items||[]).map(it=>it.productName).slice(0,2).join(", ")}{(r.items||[]).length>2?"…":""}</div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:VI.muted}}>
+            <span>{r.currentResponsibleName} · criada {fmtShort(r.createdAt)}</span>
+            <span style={{fontWeight:600,color:VI.carvao}}>R$ {r.estimatedTotal.toFixed(2)}</span>
+          </div>
+        </div>);
+      })}
+    </div>
+  </AppShell>);
+}
+
+function NewReservationForm({draft,onChange,onUpdateItem,onAddItem,onRemoveItem,roster,phoneWarning,onCheckPhone,saving,valid,onSave,savedInfo,onOpenSaved,onNewAnother,onBack}){
+  if(!draft)return null;
+  if(savedInfo){
+    const msg=waMessage(savedInfo);
+    return(<AppShell>
+      <Topbar title="Reserva salva" actions={<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={onBack}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}/>
+      <div style={{padding:"28px 22px 60px",textAlign:"center"}}>
+        <div style={{width:56,height:56,background:VI.greenBg,borderRadius:14,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
+          <Icon name="check" size={24} color={VI.green}/>
+        </div>
+        <div style={{fontSize:18,fontWeight:600,color:VI.carvao,marginBottom:4}}>Reserva criada</div>
+        <div style={{fontSize:13,color:VI.muted,marginBottom:18}}>Código <strong style={{color:VI.carvao}}>{savedInfo.reservationCode}</strong></div>
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:16,textAlign:"left",marginBottom:16}}>
+          <div style={{fontWeight:600,fontSize:14,color:VI.carvao,marginBottom:4}}>{savedInfo.customerName} · {savedInfo.customerPhone}</div>
+          <div style={{fontSize:12,color:VI.muted,marginBottom:8}}>{savedInfo.items.map(it=>`${it.reservedQuantity}x ${it.productName}`).join(", ")}</div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:VI.muted}}><span>Válida até {fmtShort(savedInfo.expiresAt)} {fmtTime(savedInfo.expiresAt)}</span><strong style={{color:VI.carvao}}>R$ {savedInfo.estimatedTotal.toFixed(2)}</strong></div>
+        </div>
+        <div style={{background:VI.surfaceAlt,border:`1px solid ${VI.border}`,borderRadius:10,padding:12,textAlign:"left",marginBottom:18,fontSize:12,color:VI.muted,whiteSpace:"pre-wrap"}}>{msg}</div>
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6}} onClick={()=>{navigator.clipboard?.writeText(msg);}}><Icon name="copy" size={13} color="#fff"/>Copiar mensagem do WhatsApp</Btn>
+          <Btn variant="ghost" onClick={onOpenSaved}>Abrir reserva</Btn>
+          <Btn variant="ghost" onClick={onNewAnother}>Nova reserva</Btn>
+          <Btn variant="ghost" onClick={onBack}>Voltar à fila</Btn>
+        </div>
+      </div>
+    </AppShell>);
+  }
+  const totals=reservationTotals(draft.items.map(it=>({reservedQuantity:it.qty,finalUnitPrice:Math.max(0,(Number(it.unitPrice)||0)-(Number(it.discount)||0))})));
+  return(<AppShell>
+    <Topbar title="Nova reserva" sub="Cadastro rápido — menos de 1 minuto" actions={<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={onBack}><Icon name="back" size={13} color={VI.muted}/>Voltar</Btn>}/>
+    <div style={{padding:"14px 22px 100px"}}>
+      <RSection title="Cliente">
+        <Inp value={draft.customerName} onChange={e=>onChange("customerName",e.target.value)} placeholder="Nome da cliente*"/>
+        <Inp value={draft.customerPhone} onChange={e=>onChange("customerPhone",maskPhone(e.target.value))} onBlur={onCheckPhone} placeholder="Telefone/WhatsApp com DDD*"/>
+        {phoneWarning.length>0&&<div style={{background:VI.yellowBg,border:`1px solid ${VI.gold}44`,borderRadius:8,padding:"9px 12px",marginBottom:12,fontSize:12,color:VI.carvao}}>
+          Este telefone já tem {phoneWarning.length} reserva{phoneWarning.length>1?"s":""} ativa{phoneWarning.length>1?"s":""} ({phoneWarning.map(r=>r.reservationCode).join(", ")}). Pode continuar se for uma nova reserva da mesma cliente.
+        </div>}
+        <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:VI.carvao,marginBottom:10,cursor:"pointer"}}>
+          <input type="checkbox" checked={draft.contactAuthorized} onChange={e=>onChange("contactAuthorized",e.target.checked)}/>Autoriza contato pelo WhatsApp
+        </label>
+        <Inp value={draft.customerNeed} onChange={e=>onChange("customerNeed",e.target.value)} placeholder="Necessidade da cliente (opcional)"/>
+      </RSection>
+
+      <RSection title="Produtos reservados">
+        {draft.items.map((it,i)=>(
+          <div key={i} style={{border:`1px solid ${VI.border}`,borderRadius:10,padding:12,marginBottom:10,background:VI.surfaceAlt}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:11,fontWeight:600,color:VI.muted,textTransform:"uppercase"}}>Item {i+1}</span>
+              {draft.items.length>1&&<button onClick={()=>onRemoveItem(i)} style={{background:"none",border:"none",cursor:"pointer",padding:3,display:"flex"}}><Icon name="x" size={13} color={VI.muted}/></button>}
+            </div>
+            <Inp value={it.productName} onChange={e=>onUpdateItem(i,"productName",e.target.value)} placeholder="Produto/descrição*" style={{marginBottom:8}}/>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+              <Inp value={it.sku} onChange={e=>onUpdateItem(i,"sku",e.target.value)} placeholder="SKU/código" style={{marginBottom:0}}/>
+              <Inp value={it.brand} onChange={e=>onUpdateItem(i,"brand",e.target.value)} placeholder="Marca" style={{marginBottom:0}}/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
+              <Inp value={it.color} onChange={e=>onUpdateItem(i,"color",e.target.value)} placeholder="Cor" style={{marginBottom:0}}/>
+              <Inp value={it.size} onChange={e=>onUpdateItem(i,"size",e.target.value)} placeholder="Tamanho" style={{marginBottom:0}}/>
+              <Inp type="number" min="1" value={it.qty} onChange={e=>onUpdateItem(i,"qty",e.target.value)} placeholder="Qtd" style={{marginBottom:0}}/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+              <Inp type="number" min="0" step="0.01" value={it.unitPrice} onChange={e=>onUpdateItem(i,"unitPrice",e.target.value)} placeholder="Valor unitário (R$)" style={{marginBottom:0}}/>
+              <Inp type="number" min="0" step="0.01" value={it.discount} onChange={e=>onUpdateItem(i,"discount",e.target.value)} placeholder="Desconto previsto (R$)" style={{marginBottom:0}}/>
+            </div>
+            <Inp value={it.notes} onChange={e=>onUpdateItem(i,"notes",e.target.value)} placeholder="Observação do item (opcional)" style={{marginBottom:0}}/>
+          </div>
+        ))}
+        <Btn variant="ghost" style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:6}} onClick={onAddItem}><Icon name="plus" size={13} color={VI.muted}/>Adicionar outro produto</Btn>
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:12,fontSize:13,padding:"10px 2px",borderTop:`1px solid ${VI.border}`}}>
+          <span style={{color:VI.muted}}>{totals.totalPieces} peça{totals.totalPieces!==1?"s":""}</span>
+          <strong style={{color:VI.carvao}}>Total estimado: R$ {totals.estimatedTotal.toFixed(2)}</strong>
+        </div>
+      </RSection>
+
+      <RSection title="Retorno">
+        <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Vendedora responsável*</div>
+        <select value={draft.sellerName} onChange={e=>onChange("sellerName",e.target.value)}
+          style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:draft.sellerName?VI.carvao:VI.muted}}>
+          <option value="">Selecione</option>
+          {roster.map(m=><option key={m.id} value={m.name}>{m.name}</option>)}
+        </select>
+        <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Data prevista de retorno*</div>
+        <input type="datetime-local" value={draft.expectedReturnAt} onChange={e=>onChange("expectedReturnAt",e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",color:VI.carvao,fontSize:14,fontFamily:"inherit",marginBottom:12,outline:"none",boxSizing:"border-box"}}/>
+        <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Reserva válida até* (vence após isso)</div>
+        <input type="datetime-local" value={draft.expiresAt} onChange={e=>onChange("expiresAt",e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",color:VI.carvao,fontSize:14,fontFamily:"inherit",marginBottom:12,outline:"none",boxSizing:"border-box"}}/>
+        <Inp value={draft.notes} onChange={e=>onChange("notes",e.target.value)} placeholder="Observações (opcional)"/>
+      </RSection>
+    </div>
+    <div style={{position:"sticky",bottom:0,background:VI.surface,borderTop:`1px solid ${VI.border}`,padding:"12px 22px",boxShadow:"0 -4px 12px rgba(44,32,32,.05)"}}>
+      <Btn variant="accent" style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:7}} disabled={!valid||saving} onClick={onSave}>
+        <Icon name="bookmark" size={14} color="#fff"/>{saving?"Salvando…":"Salvar reserva"}
+      </Btn>
+    </div>
+  </AppShell>);
+}
+
+function ReservationDetail({reservation:r,roster,now,onBack,actionModal,actionState,openAction,closeAction,setActionState,
+  onRegistrarContato,onProrrogar,onRetornouSemCompra,onCancelar,onPerder,onConverterIntegral,onVendaParcial,storeName}){
+  const liveStatus=liveReservationStatus(r,now);
+  const isOpen=RESERVATION_OPEN_STATUSES.includes(liveStatus);
+  const isFinal=["CONVERTIDA","CANCELADA","PERDIDA"].includes(r.status);
+  const hasPartialAlready=(r.items||[]).some(it=>it.remainingQuantity<it.reservedQuantity);
+  const remainingItems=(r.items||[]).filter(it=>it.remainingQuantity>0);
+
+  const openPartial=()=>openAction("partial",{
+    sellerName:r.currentResponsibleName, saleReference:"", notes:"", keepRemaining:false,
+    items:remainingItems.map(it=>({itemId:it.id,productName:it.productName,remainingQuantity:it.remainingQuantity,qtySold:it.remainingQuantity,finalPrice:it.finalUnitPrice})),
+  });
+  const updPartialItem=(i,field,val)=>setActionState(s=>({...s,items:s.items.map((it,idx)=>idx===i?{...it,[field]:val}:it)}));
+
+  return(<AppShell>
+    <Topbar title={r.customerName} sub={`${r.reservationCode} · ${r.storeName}`} actions={<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={onBack}><Icon name="back" size={13} color={VI.muted}/>Reservas</Btn>}/>
+    <div style={{padding:"14px 22px 60px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <ResBadge status={liveStatus}/>
+        <span style={{fontSize:12,color:VI.muted}}>{fmtCountdown(r.expiresAt,now)}</span>
+      </div>
+
+      <RSection title="Cliente">
+        <div style={{fontSize:14,fontWeight:500,color:VI.carvao,marginBottom:3}}>{r.customerName}</div>
+        <div style={{fontSize:13,color:VI.muted,display:"flex",alignItems:"center",gap:5}}><Icon name="phone" size={12} color={VI.muted}/>{r.customerPhone}{r.contactAuthorized&&<span style={{fontSize:10,background:VI.greenBg,color:VI.green,padding:"1px 7px",borderRadius:20,marginLeft:4}}>WhatsApp autorizado</span>}</div>
+        {r.customerNeed&&<div style={{fontSize:12,color:VI.muted,marginTop:6}}>Necessidade: {r.customerNeed}</div>}
+      </RSection>
+
+      <RSection title={`Produtos (${(r.items||[]).reduce((a,it)=>a+it.reservedQuantity,0)} peças)`}>
+        {(r.items||[]).map(it=>(
+          <div key={it.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",borderBottom:`1px solid ${VI.border}`,paddingBottom:8,marginBottom:8}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:500,color:VI.carvao}}>{it.reservedQuantity}x {it.productName}</div>
+              <div style={{fontSize:11,color:VI.muted,marginTop:2}}>{[it.sku,it.brand,it.color,it.size].filter(Boolean).join(" · ")||"—"}{it.remainingQuantity<it.reservedQuantity&&` · saldo: ${it.remainingQuantity}`}</div>
+            </div>
+            <div style={{textAlign:"right",fontSize:12,color:VI.muted,flexShrink:0}}>R$ {it.finalUnitPrice.toFixed(2)}<div style={{fontSize:10}}>{it.itemStatus}</div></div>
+          </div>
+        ))}
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginTop:6}}>
+          <span style={{color:VI.muted}}>Estimado: R$ {r.estimatedTotal.toFixed(2)}</span>
+          {r.convertedTotal>0&&<span style={{color:VI.green,fontWeight:600}}>Vendido: R$ {r.convertedTotal.toFixed(2)}</span>}
+        </div>
+      </RSection>
+
+      <RSection title="Responsável e datas">
+        <div style={{fontSize:13,color:VI.carvao,marginBottom:4}}>Responsável atual: <strong>{r.currentResponsibleName}</strong></div>
+        {r.originalSellerName!==r.currentResponsibleName&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Atendimento original: {r.originalSellerName}</div>}
+        <div style={{fontSize:12,color:VI.muted}}>Criada em {fmtShort(r.createdAt)} {fmtTime(r.createdAt)}</div>
+        <div style={{fontSize:12,color:VI.muted}}>Retorno previsto: {fmtShort(r.expectedReturnAt)} {fmtTime(r.expectedReturnAt)}</div>
+        <div style={{fontSize:12,color:VI.muted}}>Válida até: {fmtShort(r.expiresAt)} {fmtTime(r.expiresAt)}</div>
+        {r.notes&&<div style={{fontSize:12,color:VI.muted,marginTop:6,whiteSpace:"pre-wrap"}}>Obs: {r.notes}</div>}
+      </RSection>
+
+      {(r.contacts||[]).length>0&&<RSection title="Contatos registrados">
+        {r.contacts.slice().reverse().map(c=>(
+          <div key={c.id} style={{fontSize:12,color:VI.muted,borderBottom:`1px solid ${VI.border}`,paddingBottom:6,marginBottom:6}}>
+            <strong style={{color:VI.carvao}}>{CONTACT_TYPES.find(t=>t.id===c.type)?.label||c.type}</strong> · {fmtShort(c.createdAt)} {fmtTime(c.createdAt)} · {c.createdBy}
+            {c.notes&&<div>{c.notes}</div>}
+          </div>
+        ))}
+      </RSection>}
+
+      <RSection title="Histórico">
+        {(r.history||[]).slice().reverse().map(h=>(
+          <div key={h.id} style={{fontSize:12,color:VI.muted,borderBottom:`1px solid ${VI.border}`,paddingBottom:6,marginBottom:6}}>
+            <strong style={{color:VI.carvao}}>{h.action}</strong> · {fmtShort(h.createdAt)} {fmtTime(h.createdAt)} · {h.createdBy}
+            {h.justification&&<div>Motivo: {h.justification}</div>}
+          </div>
+        ))}
+      </RSection>
+
+      {!isFinal&&<div style={{display:"flex",flexDirection:"column",gap:8,marginTop:16}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          <Btn variant="ghost" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={()=>{navigator.clipboard?.writeText(waMessage(r));}}><Icon name="copy" size={12} color={VI.muted}/>Copiar msg.</Btn>
+          <Btn variant="ghost" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={()=>openAction("contato",{type:"",notes:""})}><Icon name="phone" size={12} color={VI.muted}/>Registrar contato</Btn>
+        </div>
+        <Btn variant="ghost" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={()=>openAction("extend",{newExpiresAt:r.expiresAt?.slice(0,16),justification:""})}><Icon name="clock" size={12} color={VI.muted}/>Alterar data de validade</Btn>
+        {!hasPartialAlready&&<Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={()=>openAction("convert",{sellerName:r.currentResponsibleName,saleReference:"",notes:""})}><Icon name="check" size={13} color="#fff"/>Converter em venda (tudo)</Btn>}
+        <Btn variant="dark" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={openPartial}><Icon name="package" size={13} color={VI.cream}/>Venda parcial</Btn>
+        <Btn variant="ghost" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={()=>openAction("returned",{reason:"",notes:""})}><Icon name="x" size={12} color={VI.muted}/>Cliente retornou, mas não comprou</Btn>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          <Btn variant="ghost" style={{color:VI.red,borderColor:`${VI.red}55`}} onClick={()=>openAction("cancel",{reason:"",notes:""})}>Cancelar</Btn>
+          <Btn variant="ghost" style={{color:VI.red,borderColor:`${VI.red}55`}} onClick={()=>openAction("lose",{reason:"",notes:""})}>Marcar como perdida</Btn>
+        </div>
+      </div>}
+    </div>
+
+    {actionModal==="contato"&&<Modal onClose={closeAction}><MIcon name="phone"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Registrar contato</h2>
+      <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14}}>
+        {CONTACT_TYPES.map(t=><button key={t.id} onClick={()=>setActionState(s=>({...s,type:t.id}))} style={{background:actionState.type===t.id?`${VI.terra}18`:"transparent",border:`1px solid ${actionState.type===t.id?VI.terra:VI.border}`,borderRadius:20,padding:"6px 12px",color:actionState.type===t.id?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>{t.label}</button>)}
+      </div>
+      <Inp value={actionState.notes||""} onChange={e=>setActionState(s=>({...s,notes:e.target.value}))} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="accent" disabled={!actionState.type} onClick={onRegistrarContato}>Salvar contato</Btn></div>
+    </Modal>}
+
+    {actionModal==="extend"&&<Modal onClose={closeAction}><MIcon name="clock"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Alterar data de validade</h2>
+      <input type="datetime-local" value={actionState.newExpiresAt||""} onChange={e=>setActionState(s=>({...s,newExpiresAt:e.target.value}))} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",color:VI.carvao,fontSize:14,fontFamily:"inherit",marginBottom:12,outline:"none",boxSizing:"border-box"}}/>
+      <Inp value={actionState.justification||""} onChange={e=>setActionState(s=>({...s,justification:e.target.value}))} placeholder="Justificativa*"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="accent" disabled={!actionState.newExpiresAt||!actionState.justification} onClick={onProrrogar}>Salvar novo prazo</Btn></div>
+    </Modal>}
+
+    {actionModal==="returned"&&<Modal onClose={closeAction}><MIcon name="x" color={VI.red} bg={VI.redBg}/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Cliente retornou, mas não comprou</h2>
+      <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>
+        {LOSS_REASONS.map(reason=><button key={reason} onClick={()=>setActionState(s=>({...s,reason}))} style={{textAlign:"left",background:actionState.reason===reason?VI.surfaceAlt:"transparent",border:`1px solid ${actionState.reason===reason?VI.terra:VI.border}`,borderRadius:8,padding:"9px 12px",color:VI.carvao,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{reason}</button>)}
+      </div>
+      <Inp value={actionState.notes||""} onChange={e=>setActionState(s=>({...s,notes:e.target.value}))} placeholder="Observação complementar (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="danger" disabled={!actionState.reason} onClick={onRetornouSemCompra}>Confirmar</Btn></div>
+    </Modal>}
+
+    {(actionModal==="cancel"||actionModal==="lose")&&<Modal onClose={closeAction}><MIcon name="x" color={VI.red} bg={VI.redBg}/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>{actionModal==="cancel"?"Cancelar reserva":"Marcar como perdida"}</h2>
+      <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>
+        {CANCEL_REASONS.map(reason=><button key={reason} onClick={()=>setActionState(s=>({...s,reason}))} style={{textAlign:"left",background:actionState.reason===reason?VI.surfaceAlt:"transparent",border:`1px solid ${actionState.reason===reason?VI.terra:VI.border}`,borderRadius:8,padding:"9px 12px",color:VI.carvao,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{reason}</button>)}
+      </div>
+      <Inp value={actionState.notes||""} onChange={e=>setActionState(s=>({...s,notes:e.target.value}))} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Voltar</Btn><Btn variant="danger" disabled={!actionState.reason} onClick={actionModal==="cancel"?onCancelar:onPerder}>Confirmar</Btn></div>
+    </Modal>}
+
+    {actionModal==="convert"&&<Modal onClose={closeAction}><MIcon name="check" color={VI.green} bg={VI.greenBg}/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Converter em venda</h2>
+      <p style={{color:VI.muted,fontSize:13,marginBottom:14}}>Todos os {(r.items||[]).reduce((a,it)=>a+it.reservedQuantity,0)} itens reservados serão marcados como vendidos, pelo valor final combinado (R$ {r.estimatedTotal.toFixed(2)}).</p>
+      <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Vendedora que concluiu</div>
+      <select value={actionState.sellerName||""} onChange={e=>setActionState(s=>({...s,sellerName:e.target.value}))} style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:VI.carvao}}>
+        {roster.map(m=><option key={m.id} value={m.name}>{m.name}</option>)}
+      </select>
+      <Inp value={actionState.saleReference||""} onChange={e=>setActionState(s=>({...s,saleReference:e.target.value}))} placeholder="Número do cupom/venda no PDV (opcional)"/>
+      <Inp value={actionState.notes||""} onChange={e=>setActionState(s=>({...s,notes:e.target.value}))} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="success" onClick={onConverterIntegral}>Confirmar venda</Btn></div>
+    </Modal>}
+
+    {actionModal==="partial"&&<Modal onClose={closeAction}><MIcon name="package"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Venda parcial</h2>
+      {(actionState.items||[]).map((it,i)=>(
+        <div key={it.itemId} style={{border:`1px solid ${VI.border}`,borderRadius:8,padding:10,marginBottom:8,background:VI.surfaceAlt}}>
+          <div style={{fontSize:13,fontWeight:500,color:VI.carvao,marginBottom:6}}>{it.productName} <span style={{color:VI.muted,fontWeight:400}}>(saldo: {it.remainingQuantity})</span></div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <Inp type="number" min="0" max={it.remainingQuantity} value={it.qtySold} onChange={e=>updPartialItem(i,"qtySold",e.target.value)} placeholder="Qtd vendida" style={{marginBottom:0}}/>
+            <Inp type="number" min="0" step="0.01" value={it.finalPrice} onChange={e=>updPartialItem(i,"finalPrice",e.target.value)} placeholder="Valor final unit." style={{marginBottom:0}}/>
+          </div>
+        </div>
+      ))}
+      <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:VI.carvao,margin:"6px 0 12px",cursor:"pointer"}}>
+        <input type="checkbox" checked={!!actionState.keepRemaining} onChange={e=>setActionState(s=>({...s,keepRemaining:e.target.checked}))}/>Manter o saldo restante reservado
+      </label>
+      <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Vendedora que concluiu</div>
+      <select value={actionState.sellerName||""} onChange={e=>setActionState(s=>({...s,sellerName:e.target.value}))} style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:VI.carvao}}>
+        {roster.map(m=><option key={m.id} value={m.name}>{m.name}</option>)}
+      </select>
+      <Inp value={actionState.saleReference||""} onChange={e=>setActionState(s=>({...s,saleReference:e.target.value}))} placeholder="Número do cupom/venda no PDV (opcional)"/>
+      <Inp value={actionState.notes||""} onChange={e=>setActionState(s=>({...s,notes:e.target.value}))} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="dark" onClick={onVendaParcial}>Confirmar</Btn></div>
+    </Modal>}
+  </AppShell>);
 }
 
 function AdminDashboard({onLogout}) {
