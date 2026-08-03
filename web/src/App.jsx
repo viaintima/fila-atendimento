@@ -687,7 +687,7 @@ function StoreApp({store,onLogout}) {
         {view!=="queue"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("queue")}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}
         {view!=="report"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("report")}><Icon name="chart" size={13} color={VI.muted}/>Relatório</Btn>}
         {view!=="tasks"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(taskGroups.atrasadas.length?{borderColor:VI.red,color:VI.red}:{})}} onClick={()=>setView("tasks")}><Icon name="list" size={13} color={taskGroups.atrasadas.length?VI.red:VI.muted}/>Tarefas{taskGroups.atrasadas.length>0?` (${taskGroups.atrasadas.length})`:""}</Btn>}
-        {view==="report"&&<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(store.name,queue,services,session?.startedAt)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn><Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar dia</Btn></>}
+        {view==="report"&&<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(store.name,queue,services,session?.startedAt,demands)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn><Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar dia</Btn></>}
         {view==="queue"&&<Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>{setAddPersonId("");setShowAdd(true);}}><Icon name="plus" size={13} color="#fff"/>Entrada</Btn>}
         <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,padding:"9px 10px"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
       </>}/>
@@ -733,7 +733,7 @@ function StoreApp({store,onLogout}) {
         <div><div style={{fontWeight:600,color:VI.green,fontSize:13}}>Encerrar o dia</div><div style={{fontSize:11,color:VI.muted,marginTop:2}}>Salva no histórico e zera para amanhã</div></div>
         <Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar</Btn>
       </div>
-      <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv} onEdit={s=>{setEditSvc(s);setEditStep("main");setEditSubD("");}}/>
+      <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv} demands={demands} onEdit={s=>{setEditSvc(s);setEditStep("main");setEditSubD("");}}/>
     </>}
 
     {view==="tasks"&&<TasksPanel
@@ -833,10 +833,17 @@ function PersonCard({person:p,position,isNext,onSkip,onAbsent,onEnd,done}) {
   );
 }
 
-function ReportView({services,queue,tSvc,tSales,conv,onEdit}) {
+function ReportView({services,queue,tSvc,tSales,conv,demands=[],onEdit}) {
   const nS=services.filter(s=>!s.isSale);
   const rC={};nS.forEach(s=>{rC[s.outcomeLabel]=(rC[s.outcomeLabel]||0)+1;});
   const sR=Object.entries(rC).sort((a,b)=>b[1]-a[1]);const mR=sR[0]?.[1]||1;
+  const tDone=demands.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA");
+  const tPend=demands.filter(d=>d.status==="PENDENTE").length;
+  const tLate=demands.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA").length;
+  const tPoints=tDone.reduce((a,d)=>a+(d.pointsAwarded||0),0);
+  const pointsByPerson={};
+  tDone.forEach(d=>{if(!d.completedBy)return;if(!pointsByPerson[d.completedBy])pointsByPerson[d.completedBy]={name:d.completedBy,tasks:0,points:0};pointsByPerson[d.completedBy].tasks++;pointsByPerson[d.completedBy].points+=d.pointsAwarded||0;});
+  const sortedTaskPoints=Object.values(pointsByPerson).sort((a,b)=>b.points-a.points);
   return(<div style={{padding:"8px 22px 60px"}}>
     <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,margin:"14px 0"}}>
       {[{n:tSvc,l:"Atendimentos",c:VI.carvao},{n:tSales,l:"Vendas",c:VI.green},{n:`${conv}%`,l:"Conversão",c:VI.carvao}].map((s,i)=>(
@@ -846,6 +853,19 @@ function ReportView({services,queue,tSvc,tSales,conv,onEdit}) {
         </div>
       ))}
     </div>
+    {demands.length>0&&<RSection title="Tarefas do dia">
+      <div style={{display:"flex",gap:18,marginBottom:sortedTaskPoints.length>0?16:0}}>
+        {[{v:tDone.length,l:"Concluídas",c:VI.green},{v:tPend,l:"Pendentes",c:VI.carvao},{v:tLate,l:"Atrasadas",c:tLate?VI.red:VI.carvao},{v:tPoints,l:"Pontos",c:VI.terra}].map(({v,l,c})=>(
+          <div key={l}><div style={{fontSize:20,fontWeight:700,color:c,letterSpacing:"-0.02em"}}>{v}</div><div style={{fontSize:10,color:VI.muted,textTransform:"uppercase"}}>{l}</div></div>
+        ))}
+      </div>
+      {sortedTaskPoints.map((p,i)=>(
+        <div key={p.name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:i<sortedTaskPoints.length-1?`1px solid ${VI.border}`:"none",paddingBottom:8,marginBottom:8}}>
+          <span style={{fontSize:13,color:VI.carvao}}>{p.name}</span>
+          <span style={{fontSize:12}}><span style={{color:VI.muted}}>{p.tasks} tarefa{p.tasks!==1?"s":""}</span> <span style={{color:VI.terra,fontWeight:700}}>· {p.points} pts</span></span>
+        </div>
+      ))}
+    </RSection>}
     <RSection title="Motivos de não venda">
       {sR.length===0?<p style={{color:VI.muted,fontSize:13,textAlign:"center"}}>Nenhum registro</p>
         :sR.map(([label,cnt])=>(
@@ -981,6 +1001,7 @@ function AdminDashboard({onLogout}) {
   const [dTo,setDTo]=useState("");
   const [dData,setDData]=useState(null);
   const [dBusy,setDBusy]=useState(false);
+  const [expandedPonto,setExpandedPonto]=useState(null);
   const [allHist,setAllHist]=useState({});
   const [showAdd,setShowAdd]=useState(false);
   const [newName,setNewName]=useState("");
@@ -1006,7 +1027,7 @@ function AdminDashboard({onLogout}) {
     if(!dFrom||!dTo||dStores.length===0){setDData(null);return;}
     setDBusy(true);
     const from=new Date(dFrom+"T00:00:00"),to=new Date(dTo+"T23:59:59");
-    const allSvcs=[],staffMap={},reasonMap={},storeMap={},allDemands=[];
+    const allSvcs=[],staffMap={},reasonMap={},storeMap={},allDemands=[],pontoMap={};
     const hC={};for(let h=8;h<=21;h++)hC[h]=0;
     dStores.forEach(sid=>{
       const st=stores.find(s=>s.id===sid);storeMap[sid]={name:st?.name||sid,svc:0,sales:0};
@@ -1023,10 +1044,21 @@ function AdminDashboard({onLogout}) {
           if(!staffMap[key])staffMap[key]={name:sv.salespersonName,store:st?.name||sid,svc:0,sales:0};
           staffMap[key].svc++;if(sv.isSale)staffMap[key].sales++;
         });
-        (day.demands||[]).forEach(d=>allDemands.push(d));
+        (day.demands||[]).forEach(d=>allDemands.push({...d,_store:st?.name||sid}));
+        (day.queue||[]).forEach(p=>{
+          if(!p.entryTime)return;
+          const key=`${sid}_${p.name}`;
+          if(!pontoMap[key])pontoMap[key]={name:p.name,store:st?.name||sid,days:[],totalWorkedMin:0,totalBreakMin:0};
+          const en=p.exitTime?new Date(p.exitTime):new Date();
+          const tM=en-new Date(p.entryTime);
+          const bM=(p.breaks||[]).reduce((a,b)=>{const bE=b.end?new Date(b.end):new Date();return a+(bE-new Date(b.start));},0);
+          const workedMin=Math.round(Math.max(0,tM-bM)/60000),breakMin=Math.round(bM/60000);
+          pontoMap[key].days.push({date:day.startedAt,entryTime:p.entryTime,exitTime:p.exitTime,breaks:p.breaks||[],workedMin,breakMin});
+          pontoMap[key].totalWorkedMin+=workedMin;pontoMap[key].totalBreakMin+=breakMin;
+        });
       });
       // Demandas de hoje (ainda não fechadas) contam se a loja abriu dentro do período.
-      if(curInRange)(demandsLive[sid]||[]).forEach(d=>allDemands.push(d));
+      if(curInRange)(demandsLive[sid]||[]).forEach(d=>allDemands.push({...d,_store:st?.name||sid}));
     });
     const tSvc=allSvcs.length,tSales=allSvcs.filter(s=>s.isSale).length;
     const conv=tSvc>0?Math.round((tSales/tSvc)*100):0;
@@ -1044,7 +1076,20 @@ function AdminDashboard({onLogout}) {
     const avgResolution=resTimes.length?Math.round(resTimes.reduce((a,b)=>a+b,0)/resTimes.length/60000):0;
     const onTimePct=doneTasks.length?Math.round((doneTasks.filter(d=>d.status==="CONCLUIDA_NO_PRAZO").length/doneTasks.length)*100):0;
     const tTasksDone=doneTasks.length,tTasksLate=allDemands.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA").length;
-    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate});
+    // Pontuação da equipe — quem concluiu cada tarefa e quantos pontos ganhou.
+    const pointsMap={};
+    doneTasks.forEach(d=>{
+      if(!d.completedBy)return;
+      const key=`${d._store}_${d.completedBy}`;
+      if(!pointsMap[key])pointsMap[key]={name:d.completedBy,store:d._store,tasks:0,points:0};
+      pointsMap[key].tasks++;pointsMap[key].points+=d.pointsAwarded||0;
+    });
+    const sortedPoints=Object.values(pointsMap).sort((a,b)=>b.points-a.points);
+    // Ponto — entrada/pausas/saída por vendedora, dia a dia.
+    const sortedPonto=Object.values(pontoMap)
+      .map(p=>({...p,days:p.days.sort((a,b)=>new Date(b.date)-new Date(a.date))}))
+      .sort((a,b)=>a.store.localeCompare(b.store)||a.name.localeCompare(b.name));
+    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate,sortedPoints,sortedPonto});
     setDBusy(false);
   },[dFrom,dTo,dStores,allHist,sessions,demandsLive,stores]);
 
@@ -1083,8 +1128,8 @@ function AdminDashboard({onLogout}) {
 
   const TABS=[{id:"overview",label:"Hoje",icon:"chart"},{id:"dashboard",label:"Dashboard",icon:"trend"},{id:"history",label:"Histórico",icon:"cal"},{id:"stores",label:"Lojas",icon:"store"}];
 
-  if(tab==="detail"&&detailStore){const m=mx(detailStore.id);return(<AppShell><Topbar title={detailStore.name} sub={`Dia atual · desde ${fmtTime(m.startedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("overview")}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(detailStore.name,m.queue,m.services,m.startedAt)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:m.svc,label:"Atendimentos"},{num:m.sales,label:"Vendas",color:VI.green},{num:`${m.conv}%`,label:"Conversão"},{num:m.active,label:"Em turno"}]}/><ReportView services={m.services} queue={m.queue} tSvc={m.svc} tSales={m.sales} conv={m.conv}/></AppShell>);}
-  if(tab==="histDetail"&&detailRec){const{storeName,record:rec}=detailRec;const sv=rec.services||[],q=rec.queue||[];const ts=sv.length,tsa=sv.filter(s=>s.isSale).length,cr=ts>0?Math.round((tsa/ts)*100):0;return(<AppShell><Topbar title={storeName} sub={`${fmtShort(rec.startedAt)} · ${fmtTime(rec.startedAt)} – ${fmtTime(rec.closedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("history")}><Icon name="back" size={13} color={VI.muted}/>Histórico</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(storeName,q,sv,rec.startedAt)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:ts,label:"Atendimentos"},{num:tsa,label:"Vendas",color:VI.green},{num:`${cr}%`,label:"Conversão"},{num:q.length,label:"Funcionárias"}]}/><ReportView services={sv} queue={q} tSvc={ts} tSales={tsa} conv={cr}/></AppShell>);}
+  if(tab==="detail"&&detailStore){const m=mx(detailStore.id);const dm=demandsLive[detailStore.id]||[];return(<AppShell><Topbar title={detailStore.name} sub={`Dia atual · desde ${fmtTime(m.startedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("overview")}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(detailStore.name,m.queue,m.services,m.startedAt,dm)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:m.svc,label:"Atendimentos"},{num:m.sales,label:"Vendas",color:VI.green},{num:`${m.conv}%`,label:"Conversão"},{num:m.active,label:"Em turno"}]}/><ReportView services={m.services} queue={m.queue} tSvc={m.svc} tSales={m.sales} conv={m.conv} demands={dm}/></AppShell>);}
+  if(tab==="histDetail"&&detailRec){const{storeName,record:rec}=detailRec;const sv=rec.services||[],q=rec.queue||[],dm=rec.demands||[];const ts=sv.length,tsa=sv.filter(s=>s.isSale).length,cr=ts>0?Math.round((tsa/ts)*100):0;return(<AppShell><Topbar title={storeName} sub={`${fmtShort(rec.startedAt)} · ${fmtTime(rec.startedAt)} – ${fmtTime(rec.closedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("history")}><Icon name="back" size={13} color={VI.muted}/>Histórico</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(storeName,q,sv,rec.startedAt,dm)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:ts,label:"Atendimentos"},{num:tsa,label:"Vendas",color:VI.green},{num:`${cr}%`,label:"Conversão"},{num:q.length,label:"Funcionárias"}]}/><ReportView services={sv} queue={q} tSvc={ts} tSales={tsa} conv={cr} demands={dm}/></AppShell>);}
 
   return(<AppShell>
     <Topbar title="Painel Admin" sub={<span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>}
@@ -1190,6 +1235,21 @@ function AdminDashboard({onLogout}) {
           </div>
           {dData.tTasksLate>0&&<div style={{marginTop:12,fontSize:12,color:VI.red,display:"flex",alignItems:"center",gap:5}}><Icon name="clock" size={13} color={VI.red}/>{dData.tTasksLate} tarefa{dData.tTasksLate>1?"s":""} atrasada{dData.tTasksLate>1?"s":""} ou escalada{dData.tTasksLate>1?"s":""} no período (ainda em aberto).</div>}
         </div>
+        {dData.sortedPoints.length>0&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
+          <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Pontuação da equipe (tarefas)</div>
+          {dData.sortedPoints.map((p,i)=>(
+            <div key={`${p.store}_${p.name}`} style={{display:"flex",alignItems:"center",gap:10,borderBottom:`1px solid ${VI.border}`,paddingBottom:8,marginBottom:8}}>
+              <div style={{width:26,height:26,background:VI.surfaceAlt,borderRadius:5,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:600,color:VI.muted}}>
+                {i===0?<Icon name="star" size={11} color={VI.gold} sw={2}/>:i+1}
+              </div>
+              <div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:500,color:VI.carvao}}>{p.name}</div>{dData.sortedStores.length>1&&<div style={{fontSize:11,color:VI.muted}}>{p.store}</div>}</div>
+              <div style={{display:"flex",gap:8,flexShrink:0,fontSize:12,alignItems:"center"}}>
+                <span style={{color:VI.muted}}>{p.tasks} tarefa{p.tasks!==1?"s":""}</span>
+                <span style={{color:VI.terra,fontWeight:700,minWidth:44,textAlign:"right"}}>{p.points} pts</span>
+              </div>
+            </div>
+          ))}
+        </div>}
         {dData.sortedStores.length>1&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
           <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Por loja</div>
           {dData.sortedStores.map((s,i)=>{const maxS=dData.sortedStores[0].sales||1;const cc=s.conv>=60?VI.green:s.conv>=40?VI.yellow:VI.red;return(
@@ -1235,6 +1295,32 @@ function AdminDashboard({onLogout}) {
               </div>
             </div>
           );})}
+        </div>}
+        {dData.sortedPonto.length>0&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
+          <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Ponto — por vendedora</div>
+          {dData.sortedPonto.map(p=>{
+            const key=`${p.store}_${p.name}`;const open=expandedPonto===key;
+            const fmtH=m=>Math.floor(m/60)>0?`${Math.floor(m/60)}h ${m%60}m`:`${m}m`;
+            return(<div key={key} style={{borderBottom:`1px solid ${VI.border}`,paddingBottom:8,marginBottom:8}}>
+              <button onClick={()=>setExpandedPonto(open?null:key)} style={{display:"flex",alignItems:"center",gap:10,width:"100%",background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0,textAlign:"left"}}>
+                <div style={{width:26,height:26,background:VI.surfaceAlt,borderRadius:5,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:600,color:VI.muted}}>{ini(p.name)}</div>
+                <div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:500,color:VI.carvao}}>{p.name}</div>{dData.sortedStores.length>1&&<div style={{fontSize:11,color:VI.muted}}>{p.store}</div>}</div>
+                <div style={{display:"flex",gap:8,flexShrink:0,fontSize:12,alignItems:"center"}}>
+                  <span style={{color:VI.muted}}>{p.days.length} dia{p.days.length!==1?"s":""}</span>
+                  <span style={{color:VI.carvao,fontWeight:600}}>{fmtH(p.totalWorkedMin)}</span>
+                  <Icon name={open?"chevD":"chevR"} size={13} color={VI.border}/>
+                </div>
+              </button>
+              {open&&<div style={{marginTop:8,paddingLeft:36,display:"flex",flexDirection:"column",gap:6}}>
+                {p.days.map((d,i)=>(
+                  <div key={i} style={{fontSize:12,color:VI.muted,display:"flex",justifyContent:"space-between",gap:10}}>
+                    <span style={{textTransform:"capitalize",flexShrink:0}}>{fmtShort(d.date)}</span>
+                    <span style={{textAlign:"right"}}>Entrada {fmtTime(d.entryTime)}{d.breaks.map((b,j)=>` · P${j+1} ${fmtTime(b.start)}–${b.end?fmtTime(b.end):"…"}`)}{d.exitTime?` · Saída ${fmtTime(d.exitTime)}`:""} · <strong style={{color:VI.carvao}}>{fmtH(d.workedMin)}</strong></span>
+                  </div>
+                ))}
+              </div>}
+            </div>);
+          })}
         </div>}
       </>}
     </div>}
@@ -1512,8 +1598,15 @@ function NewDemandModal({stores,storeId,setStoreId,quickIdx,onPickQuick,title,se
   </Modal>);
 }
 
-function exportPDF(storeName,queue,services,startedAt){
+function exportPDF(storeName,queue,services,startedAt,demands=[]){
   const nS=services.filter(s=>!s.isSale);
+  const tDone=demands.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA");
+  const tPend=demands.filter(d=>d.status==="PENDENTE").length;
+  const tLate=demands.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA").length;
+  const tPoints=tDone.reduce((a,d)=>a+(d.pointsAwarded||0),0);
+  const pointsByPerson={};
+  tDone.forEach(d=>{if(!d.completedBy)return;if(!pointsByPerson[d.completedBy])pointsByPerson[d.completedBy]={name:d.completedBy,tasks:0,points:0};pointsByPerson[d.completedBy].tasks++;pointsByPerson[d.completedBy].points+=d.pointsAwarded||0;});
+  const sortedTaskPoints=Object.values(pointsByPerson).sort((a,b)=>b.points-a.points);
   const tV=services.length,tSa=services.filter(s=>s.isSale).length;
   const cr=tV>0?Math.round((tSa/tV)*100):0;
   const dur=services.filter(s=>s.startTime&&s.endTime).map(s=>new Date(s.endTime)-new Date(s.startTime));
@@ -1625,6 +1718,17 @@ ${(pk&&pk[1]>0)||best?`<div class="k2">
   <td class="tc" style="font-weight:600">${p.ps.length}</td><td class="tc tg">${p.pS}</td>
   <td><div class="bar-wrap"><div class="bar-track">${bar(p.pC,100,cc(p.pC))}</div><span class="bar-lbl" style="color:${cc(p.pC)}">${p.pC}%</span></div></td>
 </tr>`).join("")}</tbody></table></div>
+
+${demands.length>0?`<div class="sec nb"><div class="sec-t">Tarefas do Dia</div>
+<div class="k4">
+  <div class="kp gr"><div class="kn">${tDone.length}</div><div class="kl">Concluídas</div></div>
+  <div class="kp"><div class="kn">${tPend}</div><div class="kl">Pendentes</div></div>
+  <div class="kp" style="${tLate?'background:#FBEAEA;border-color:#B8323244':''}"><div class="kn" style="${tLate?'color:#B83232':''}">${tLate}</div><div class="kl">Atrasadas</div></div>
+  <div class="kp am"><div class="kn">${tPoints}</div><div class="kl">Pontos</div></div>
+</div>
+${sortedTaskPoints.length>0?`<table style="margin-top:14px"><thead><tr><th>Funcionária</th><th class="tc">Tarefas</th><th class="tc">Pontos</th></tr></thead>
+<tbody>${sortedTaskPoints.map(p=>`<tr><td class="tn">${p.name}</td><td class="tc">${p.tasks}</td><td class="tc tg">${p.points}</td></tr>`).join("")}</tbody></table>`:""}
+</div>`:""}
 
 ${services.length>0?`<div class="sec nb"><div class="sec-t">Movimento por Hora</div>
 <div class="hcont">${hD.map(([h,c])=>{const ip=parseInt(h)===parseInt(pk?.[0])&&c>0;const bh=mH>0?Math.max((c/mH)*64,c>0?3:0):0;return`<div class="hcol"><div class="hv" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div style="flex:1;display:flex;align-items:flex-end;width:100%"><div class="hbar" style="height:${bh}px;background:${ip?"#B5706A":c>0?"#F2B5C0":"#EDD9D3"}"></div></div><div class="hl" style="color:${ip?"#B5706A":"#9E7E78"}">${h}h</div></div>`;}).join("")}</div>
