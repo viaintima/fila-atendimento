@@ -487,7 +487,15 @@ function StoreApp({store,onLogout}) {
     await setDoc(sessionRef(store.id),{startedAt:fs||session?.startedAt||new Date().toISOString(),queue:nq??queue,services:ns??services,updatedAt:serverTimestamp()});
   };
   const closeDay=async()=>{
-    await setDoc(histDayRef(store.id,uid()),{startedAt:session?.startedAt||new Date().toISOString(),closedAt:new Date().toISOString(),queue,services,demands});
+    // Ao encerrar o dia, quem ainda estiver na fila sai automaticamente —
+    // isso marca o ponto de saída de quem esqueceu de encerrar o expediente.
+    const closedAt=new Date().toISOString();
+    const closedQueue=queue.map(p=>{
+      if(p.status==="done")return p;
+      const breaks=(p.breaks||[]).map((b,i)=>i===p.breaks.length-1&&!b.end?{...b,end:closedAt}:b);
+      return{...p,status:"done",exitTime:p.exitTime||closedAt,breaks};
+    });
+    await setDoc(histDayRef(store.id,uid()),{startedAt:session?.startedAt||new Date().toISOString(),closedAt,queue:closedQueue,services,demands});
     await setDoc(sessionRef(store.id),{startedAt:null,queue:[],services:[],updatedAt:serverTimestamp()});
     await setDoc(demandsRef(store.id),{items:[],updatedAt:serverTimestamp()});
     setSession(null);setQueue([]);setServices([]);setConfClose(false);setView("queue");setCurSvc(null);setDemands([]);
@@ -761,7 +769,7 @@ function StoreApp({store,onLogout}) {
 
     {confEnd&&<Modal onClose={()=>setConfEnd(null)}><MIcon name="logout" color={VI.red} bg={VI.redBg}/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Encerrar expediente?</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>{queue.find(p=>p.id===confEnd)?.name} será removida da fila.</p><div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setConfEnd(null)}>Cancelar</Btn><Btn variant="danger" onClick={()=>endShift(confEnd)}>Confirmar saída</Btn></div></Modal>}
 
-    {confClose&&<Modal onClose={()=>setConfClose(false)}><MIcon name="moon" color={VI.green} bg={VI.greenBg}/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Encerrar o dia?</h2><p style={{color:VI.muted,fontSize:13,marginBottom:10}}>O relatório será salvo e a fila será zerada para amanhã.</p><div style={{background:VI.surfaceAlt,borderRadius:8,padding:"11px 13px",marginBottom:18,fontSize:13,border:`1px solid ${VI.border}`}}><div style={{fontWeight:500}}>{tSvc} atendimentos · {tSales} vendas · {conv}% conversão</div><div style={{color:VI.muted,fontSize:11,marginTop:2}}>Iniciado às {fmtTime(session?.startedAt)}</div></div><div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setConfClose(false)}>Cancelar</Btn><Btn variant="success" onClick={closeDay}>Confirmar encerramento</Btn></div></Modal>}
+    {confClose&&<Modal onClose={()=>setConfClose(false)}><MIcon name="moon" color={VI.green} bg={VI.greenBg}/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Encerrar o dia?</h2><p style={{color:VI.muted,fontSize:13,marginBottom:10}}>O relatório será salvo e a fila será zerada para amanhã.</p><div style={{background:VI.surfaceAlt,borderRadius:8,padding:"11px 13px",marginBottom:queue.filter(p=>p.status!=="done").length>0?10:18,fontSize:13,border:`1px solid ${VI.border}`}}><div style={{fontWeight:500}}>{tSvc} atendimentos · {tSales} vendas · {conv}% conversão</div><div style={{color:VI.muted,fontSize:11,marginTop:2}}>Iniciado às {fmtTime(session?.startedAt)}</div></div>{queue.filter(p=>p.status!=="done").length>0&&<div style={{background:VI.yellowBg,border:`1px solid ${VI.gold}44`,borderRadius:8,padding:"10px 13px",marginBottom:18,fontSize:12,color:VI.carvao}}>{queue.filter(p=>p.status!=="done").length} vendedora{queue.filter(p=>p.status!=="done").length>1?"s ainda":" ainda"} na fila — a saída dela{queue.filter(p=>p.status!=="done").length>1?"s":""} será marcada automaticamente agora.</div>}<div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={()=>setConfClose(false)}>Cancelar</Btn><Btn variant="success" onClick={closeDay}>Confirmar encerramento</Btn></div></Modal>}
 
     {editSvc&&<Modal onClose={()=>{setEditSvc(null);setEditStep("main");setEditSubD("");}}><MIcon name="edit"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Editar atendimento</h2><p style={{color:VI.muted,fontSize:12,marginBottom:16}}>{editSvc.salespersonName} · {fmtTime(editSvc.startTime)}<br/><span style={{color:editSvc.isSale?VI.green:VI.red}}>Atual: {editSvc.outcomeLabel}</span></p>
       {editStep==="main"&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{MAIN_OUTCOMES.map(o=><button key={o.id} onClick={()=>o.id==="nao_vendeu"?setEditStep("sub"):editSvcFn(editSvc.id,o.id)} style={{background:o.isSale?VI.greenBg:VI.redBg,border:`1px solid ${o.color}44`,borderRadius:10,padding:"12px 14px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",fontFamily:"inherit"}}><span style={{fontSize:13,color:VI.carvao,fontWeight:500}}>{o.label}</span><Icon name={o.isSale?"check":"x"} size={15} color={o.color}/></button>)}</div>}
@@ -1963,5 +1971,3 @@ tbody tr:last-child td{border-bottom:none}
   const w=window.open("","_blank");
   if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
 }
-
-                        
