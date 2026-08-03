@@ -1001,7 +1001,12 @@ function AdminDashboard({onLogout}) {
   const [dTo,setDTo]=useState("");
   const [dData,setDData]=useState(null);
   const [dBusy,setDBusy]=useState(false);
-  const [expandedPonto,setExpandedPonto]=useState(null);
+  const [pStoreId,setPStoreId]=useState("");
+  const [pName,setPName]=useState("");
+  const [pFrom,setPFrom]=useState("");
+  const [pTo,setPTo]=useState("");
+  const [pResult,setPResult]=useState(null);
+  const [pBusy,setPBusy]=useState(false);
   const [allHist,setAllHist]=useState({});
   const [showAdd,setShowAdd]=useState(false);
   const [newName,setNewName]=useState("");
@@ -1021,13 +1026,37 @@ function AdminDashboard({onLogout}) {
     const data={};for(const s of stores){const snap=await getDocs(query(historyCol(s.id),orderBy("closedAt","desc")));data[s.id]=snap.docs.map(d=>({id:d.id,...d.data()}));}
     setHistories(data);setAllHist(data);
   },[stores]);
-  useEffect(()=>{if(tab==="history"||tab==="dashboard")loadHist();},[tab,loadHist]);
+  useEffect(()=>{if(tab==="history"||tab==="dashboard"||tab==="ponto")loadHist();},[tab,loadHist]);
+
+  const pRoster=stores.find(s=>s.id===pStoreId)?.roster||[];
+  const runPonto=()=>{
+    if(!pStoreId||!pName||!pFrom||!pTo)return;
+    setPBusy(true);
+    const from=new Date(pFrom+"T00:00:00"),to=new Date(pTo+"T23:59:59");
+    const hist=allHist[pStoreId]||[];const cur=sessions[pStoreId];const allD=[...hist];
+    if(cur?.startedAt){const sd=new Date(cur.startedAt);if(sd>=from&&sd<=to)allD.push({...cur,id:"current"});}
+    const days=[];
+    allD.forEach(day=>{
+      const dd=new Date(day.startedAt);if(dd<from||dd>to)return;
+      const p=(day.queue||[]).find(q=>q.name===pName);
+      if(!p||!p.entryTime)return;
+      const en=p.exitTime?new Date(p.exitTime):new Date();
+      const tM=en-new Date(p.entryTime);
+      const bM=(p.breaks||[]).reduce((a,b)=>{const bE=b.end?new Date(b.end):new Date();return a+(bE-new Date(b.start));},0);
+      const workedMin=Math.round(Math.max(0,tM-bM)/60000);
+      days.push({date:day.startedAt,entryTime:p.entryTime,exitTime:p.exitTime,breaks:p.breaks||[],workedMin});
+    });
+    days.sort((a,b)=>new Date(b.date)-new Date(a.date));
+    const totalWorkedMin=days.reduce((a,d)=>a+d.workedMin,0);
+    setPResult({days,totalWorkedMin,daysCount:days.length});
+    setPBusy(false);
+  };
 
   const runDash=useCallback(()=>{
     if(!dFrom||!dTo||dStores.length===0){setDData(null);return;}
     setDBusy(true);
     const from=new Date(dFrom+"T00:00:00"),to=new Date(dTo+"T23:59:59");
-    const allSvcs=[],staffMap={},reasonMap={},storeMap={},allDemands=[],pontoMap={};
+    const allSvcs=[],staffMap={},reasonMap={},storeMap={},allDemands=[];
     const hC={};for(let h=8;h<=21;h++)hC[h]=0;
     dStores.forEach(sid=>{
       const st=stores.find(s=>s.id===sid);storeMap[sid]={name:st?.name||sid,svc:0,sales:0};
@@ -1045,17 +1074,6 @@ function AdminDashboard({onLogout}) {
           staffMap[key].svc++;if(sv.isSale)staffMap[key].sales++;
         });
         (day.demands||[]).forEach(d=>allDemands.push({...d,_store:st?.name||sid}));
-        (day.queue||[]).forEach(p=>{
-          if(!p.entryTime)return;
-          const key=`${sid}_${p.name}`;
-          if(!pontoMap[key])pontoMap[key]={name:p.name,store:st?.name||sid,days:[],totalWorkedMin:0,totalBreakMin:0};
-          const en=p.exitTime?new Date(p.exitTime):new Date();
-          const tM=en-new Date(p.entryTime);
-          const bM=(p.breaks||[]).reduce((a,b)=>{const bE=b.end?new Date(b.end):new Date();return a+(bE-new Date(b.start));},0);
-          const workedMin=Math.round(Math.max(0,tM-bM)/60000),breakMin=Math.round(bM/60000);
-          pontoMap[key].days.push({date:day.startedAt,entryTime:p.entryTime,exitTime:p.exitTime,breaks:p.breaks||[],workedMin,breakMin});
-          pontoMap[key].totalWorkedMin+=workedMin;pontoMap[key].totalBreakMin+=breakMin;
-        });
       });
       // Demandas de hoje (ainda não fechadas) contam se a loja abriu dentro do período.
       if(curInRange)(demandsLive[sid]||[]).forEach(d=>allDemands.push({...d,_store:st?.name||sid}));
@@ -1085,11 +1103,7 @@ function AdminDashboard({onLogout}) {
       pointsMap[key].tasks++;pointsMap[key].points+=d.pointsAwarded||0;
     });
     const sortedPoints=Object.values(pointsMap).sort((a,b)=>b.points-a.points);
-    // Ponto — entrada/pausas/saída por vendedora, dia a dia.
-    const sortedPonto=Object.values(pontoMap)
-      .map(p=>({...p,days:p.days.sort((a,b)=>new Date(b.date)-new Date(a.date))}))
-      .sort((a,b)=>a.store.localeCompare(b.store)||a.name.localeCompare(b.name));
-    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate,sortedPoints,sortedPonto});
+    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate,sortedPoints});
     setDBusy(false);
   },[dFrom,dTo,dStores,allHist,sessions,demandsLive,stores]);
 
@@ -1126,7 +1140,7 @@ function AdminDashboard({onLogout}) {
     await setDoc(storeRef(teamStore.id),{roster:nr},{merge:true});
   };
 
-  const TABS=[{id:"overview",label:"Hoje",icon:"chart"},{id:"dashboard",label:"Dashboard",icon:"trend"},{id:"history",label:"Histórico",icon:"cal"},{id:"stores",label:"Lojas",icon:"store"}];
+  const TABS=[{id:"overview",label:"Hoje",icon:"chart"},{id:"dashboard",label:"Dashboard",icon:"trend"},{id:"ponto",label:"Ponto",icon:"clock"},{id:"history",label:"Histórico",icon:"cal"},{id:"stores",label:"Lojas",icon:"store"}];
 
   if(tab==="detail"&&detailStore){const m=mx(detailStore.id);const dm=demandsLive[detailStore.id]||[];return(<AppShell><Topbar title={detailStore.name} sub={`Dia atual · desde ${fmtTime(m.startedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("overview")}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(detailStore.name,m.queue,m.services,m.startedAt,dm)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:m.svc,label:"Atendimentos"},{num:m.sales,label:"Vendas",color:VI.green},{num:`${m.conv}%`,label:"Conversão"},{num:m.active,label:"Em turno"}]}/><ReportView services={m.services} queue={m.queue} tSvc={m.svc} tSales={m.sales} conv={m.conv} demands={dm}/></AppShell>);}
   if(tab==="histDetail"&&detailRec){const{storeName,record:rec}=detailRec;const sv=rec.services||[],q=rec.queue||[],dm=rec.demands||[];const ts=sv.length,tsa=sv.filter(s=>s.isSale).length,cr=ts>0?Math.round((tsa/ts)*100):0;return(<AppShell><Topbar title={storeName} sub={`${fmtShort(rec.startedAt)} · ${fmtTime(rec.startedAt)} – ${fmtTime(rec.closedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("history")}><Icon name="back" size={13} color={VI.muted}/>Histórico</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(storeName,q,sv,rec.startedAt,dm)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:ts,label:"Atendimentos"},{num:tsa,label:"Vendas",color:VI.green},{num:`${cr}%`,label:"Conversão"},{num:q.length,label:"Funcionárias"}]}/><ReportView services={sv} queue={q} tSvc={ts} tSales={tsa} conv={cr} demands={dm}/></AppShell>);}
@@ -1296,33 +1310,64 @@ function AdminDashboard({onLogout}) {
             </div>
           );})}
         </div>}
-        {dData.sortedPonto.length>0&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
-          <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Ponto — por vendedora</div>
-          {dData.sortedPonto.map(p=>{
-            const key=`${p.store}_${p.name}`;const open=expandedPonto===key;
-            const fmtH=m=>Math.floor(m/60)>0?`${Math.floor(m/60)}h ${m%60}m`:`${m}m`;
-            return(<div key={key} style={{borderBottom:`1px solid ${VI.border}`,paddingBottom:8,marginBottom:8}}>
-              <button onClick={()=>setExpandedPonto(open?null:key)} style={{display:"flex",alignItems:"center",gap:10,width:"100%",background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0,textAlign:"left"}}>
-                <div style={{width:26,height:26,background:VI.surfaceAlt,borderRadius:5,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:600,color:VI.muted}}>{ini(p.name)}</div>
-                <div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:500,color:VI.carvao}}>{p.name}</div>{dData.sortedStores.length>1&&<div style={{fontSize:11,color:VI.muted}}>{p.store}</div>}</div>
-                <div style={{display:"flex",gap:8,flexShrink:0,fontSize:12,alignItems:"center"}}>
-                  <span style={{color:VI.muted}}>{p.days.length} dia{p.days.length!==1?"s":""}</span>
-                  <span style={{color:VI.carvao,fontWeight:600}}>{fmtH(p.totalWorkedMin)}</span>
-                  <Icon name={open?"chevD":"chevR"} size={13} color={VI.border}/>
-                </div>
-              </button>
-              {open&&<div style={{marginTop:8,paddingLeft:36,display:"flex",flexDirection:"column",gap:6}}>
-                {p.days.map((d,i)=>(
-                  <div key={i} style={{fontSize:12,color:VI.muted,display:"flex",justifyContent:"space-between",gap:10}}>
-                    <span style={{textTransform:"capitalize",flexShrink:0}}>{fmtShort(d.date)}</span>
-                    <span style={{textAlign:"right"}}>Entrada {fmtTime(d.entryTime)}{d.breaks.map((b,j)=>` · P${j+1} ${fmtTime(b.start)}–${b.end?fmtTime(b.end):"…"}`)}{d.exitTime?` · Saída ${fmtTime(d.exitTime)}`:""} · <strong style={{color:VI.carvao}}>{fmtH(d.workedMin)}</strong></span>
-                  </div>
-                ))}
-              </div>}
-            </div>);
-          })}
-        </div>}
       </>}
+    </div>}
+
+    {tab==="ponto"&&<div style={{padding:"18px 22px"}}>
+      <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:12}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:12}}>Consultar ponto</div>
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Loja</div>
+          <select value={pStoreId} onChange={e=>{setPStoreId(e.target.value);setPName("");setPResult(null);}}
+            style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",fontSize:13,fontFamily:"inherit",cursor:"pointer",color:pStoreId?VI.carvao:VI.muted,outline:"none",boxSizing:"border-box"}}>
+            <option value="">Selecione a loja</option>
+            {stores.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Vendedora</div>
+          <select value={pName} onChange={e=>setPName(e.target.value)} disabled={!pStoreId}
+            style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",fontSize:13,fontFamily:"inherit",cursor:pStoreId?"pointer":"not-allowed",color:pName?VI.carvao:VI.muted,outline:"none",boxSizing:"border-box"}}>
+            <option value="">Selecione a vendedora</option>
+            {pRoster.map(m=><option key={m.id} value={m.name}>{m.name}</option>)}
+          </select>
+          {pStoreId&&pRoster.length===0&&<p style={{color:VI.muted,fontSize:12,marginTop:6}}>Esta loja ainda não tem equipe cadastrada.</p>}
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+          {[["Data inicial",pFrom,setPFrom],["Data final",pTo,setPTo]].map(([l,v,s])=>(
+            <div key={l}><div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>{l}</div>
+            <input type="date" value={v} onChange={e=>s(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/></div>
+          ))}
+        </div>
+        <Btn variant="accent" style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:7}} disabled={!pStoreId||!pName||!pFrom||!pTo||pBusy} onClick={runPonto}>
+          <Icon name="clock" size={13} color="#fff"/>{pBusy?"Buscando…":"Buscar ponto"}
+        </Btn>
+      </div>
+
+      {pResult&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <div style={{fontSize:14,fontWeight:600,color:VI.carvao}}>{pName}</div>
+          <div style={{display:"flex",gap:16,fontSize:12}}>
+            <span style={{color:VI.muted}}>{pResult.daysCount} dia{pResult.daysCount!==1?"s":""}</span>
+            <span style={{color:VI.terra,fontWeight:700}}>{Math.floor(pResult.totalWorkedMin/60)}h {pResult.totalWorkedMin%60}m total</span>
+          </div>
+        </div>
+        {pResult.days.length===0&&<p style={{color:VI.muted,fontSize:13,textAlign:"center",padding:"20px 0"}}>Nenhum registro de ponto no período.</p>}
+        {pResult.days.map((d,i)=>{
+          const wh=Math.floor(d.workedMin/60),wm=d.workedMin%60;
+          return(<div key={i} style={{padding:"10px 0",borderBottom:i<pResult.days.length-1?`1px solid ${VI.border}`:"none"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+              <span style={{fontSize:13,fontWeight:500,color:VI.carvao,textTransform:"capitalize"}}>{fmtShort(d.date)}</span>
+              <span style={{fontSize:13,fontWeight:600,color:VI.carvao}}>{wh>0?`${wh}h ${wm}m`:`${wm}m`}</span>
+            </div>
+            <div style={{fontSize:12,color:VI.muted}}>
+              Entrada {fmtTime(d.entryTime)}
+              {d.breaks.map((b,j)=>` · Pausa ${j+1}: ${fmtTime(b.start)}–${b.end?fmtTime(b.end):"em andamento"}`)}
+              {d.exitTime?` · Saída ${fmtTime(d.exitTime)}`:" · ainda em turno"}
+            </div>
+          </div>);
+        })}
+      </div>}
     </div>}
 
     {tab==="stores"&&<div style={{padding:"18px 22px"}}>
@@ -1750,3 +1795,4 @@ ${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
   const w=window.open("","_blank");
   if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
 }
+
