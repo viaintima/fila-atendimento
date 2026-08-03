@@ -1577,4 +1577,65 @@ tbody tr:last-child td{border-bottom:none}
 .rf{height:100%;background:#B5706A;border-radius:99px}
 .rq{flex:0 0 22px;font-weight:700;font-size:12px;text-align:right}
 .rp{flex:0 0 34px;font-size:11px;color:#9E7E78;text-align:right}
-.hcont{display:flex;align-items:flex-end;gap:4px;height:76px;marg
+.hcont{display:flex;align-items:flex-end;gap:4px;height:76px;margin-bottom:5px}
+.hcol{display:flex;flex-direction:column;align-items:center;gap:2px;flex:1}
+.hbar{width:100%;border-radius:2px 2px 0 0;min-height:2px}
+.hl{font-size:8px;color:#9E7E78}
+.hv{font-size:8px;font-weight:700;color:#9E7E78}
+.hi{display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #F5EDE8;font-size:12px}
+.hi:last-child{border-bottom:none}
+.ht{color:#9E7E78;flex:0 0 40px}.hname{flex:1;font-weight:500}.hout{flex:0 0 150px;text-align:right;font-size:11px;font-weight:500}
+.badge{display:inline-block;padding:1px 7px;border-radius:20px;font-size:9px;font-weight:700;background:#FDF6E3;color:#A07820;border:1px solid #C9A84C44}
+.ft{margin-top:36px;padding-top:12px;border-top:1px solid #EDD9D3;display:flex;justify-content:space-between;color:#9E7E78;font-size:11px}
+.nb{page-break-inside:avoid}
+@media print{.pg{padding:28px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body><div class="pg">
+
+<div class="rh">
+  <div><div class="brand">Via Íntima</div><h1>Relatório de Atendimentos</h1></div>
+  <div class="meta"><strong>${gD}</strong>${wD}<br>${storeName} · ${gT}</div>
+</div>
+
+<div class="sec nb"><div class="sec-t">Resumo Executivo</div>
+<div class="k4">
+  <div class="kp"><div class="kn">${tV}</div><div class="kl">Atendimentos</div></div>
+  <div class="kp gr"><div class="kn">${tSa}</div><div class="kl">Vendas</div><div class="ks">${nS.length} sem conversão</div></div>
+  <div class="kp dk"><div class="kn" style="color:${cr>=60?"#86efac":cr>=40?"#fde68a":"#fca5a5"}">${cr}%</div><div class="kl" style="color:#9E7E78">Conversão</div><div class="ks">${cr>=60?"Meta atingida":cr>=40?"Próximo da meta":"Abaixo da meta"}</div></div>
+  <div class="kp"><div class="kn">${aD>0?aD+"'":"—"}</div><div class="kl">Tempo Médio</div></div>
+</div>
+${(pk&&pk[1]>0)||best?`<div class="k2">
+  ${pk&&pk[1]>0?`<div class="kp am"><div class="kl" style="text-align:left">Horário de Pico</div><div style="font-size:15px;font-weight:700;margin-top:5px">${pk[0]}h – ${parseInt(pk[0])+1}h</div><div class="ks">${pk[1]} atendimento${pk[1]>1?"s":""}</div></div>`:"<div></div>"}
+  ${best?`<div class="kp am"><div class="kl" style="text-align:left">Destaque do Dia <span class="badge">★</span></div><div style="font-size:15px;font-weight:700;margin-top:5px">${best.name}</div><div class="ks">${best.pS} venda${best.pS!==1?"s":""} · ${best.pC}%</div></div>`:"<div></div>"}
+</div>`:""}
+</div>
+
+<div class="sec nb"><div class="sec-t">Performance por Funcionária</div>
+<table><thead><tr><th>Funcionária</th><th>Entrada</th><th>Saída</th><th>Expediente</th><th>Pausas</th><th class="tc">Atend.</th><th class="tc">Vendas</th><th>Conversão</th></tr></thead>
+<tbody>${st.map(p=>`<tr>
+  <td class="tn">${p.name}${p.pS===mSS&&mSS>0?" <span class='badge'>★</span>":""}</td>
+  <td class="td">${fmtTime(p.entryTime)}</td><td class="td">${p.exitTime?fmtTime(p.exitTime):"—"}</td>
+  <td class="td">${p.wS}</td><td class="td">${p.bS}</td>
+  <td class="tc" style="font-weight:600">${p.ps.length}</td><td class="tc tg">${p.pS}</td>
+  <td><div class="bar-wrap"><div class="bar-track">${bar(p.pC,100,cc(p.pC))}</div><span class="bar-lbl" style="color:${cc(p.pC)}">${p.pC}%</span></div></td>
+</tr>`).join("")}</tbody></table></div>
+
+${services.length>0?`<div class="sec nb"><div class="sec-t">Movimento por Hora</div>
+<div class="hcont">${hD.map(([h,c])=>{const ip=parseInt(h)===parseInt(pk?.[0])&&c>0;const bh=mH>0?Math.max((c/mH)*64,c>0?3:0):0;return`<div class="hcol"><div class="hv" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div style="flex:1;display:flex;align-items:flex-end;width:100%"><div class="hbar" style="height:${bh}px;background:${ip?"#B5706A":c>0?"#F2B5C0":"#EDD9D3"}"></div></div><div class="hl" style="color:${ip?"#B5706A":"#9E7E78"}">${h}h</div></div>`;}).join("")}</div>
+</div>`:""}
+
+<div class="sec nb"><div class="sec-t">Motivos de Não Venda</div>
+${sR.length===0?'<p style="color:#9E7E78;font-size:13px">Todos os atendimentos resultaram em venda.</p>'
+:sR.map(([l,c])=>`<div class="rb"><div class="rn">${l}</div><div class="rt"><div class="rf" style="width:${Math.round((c/mR)*100)}%"></div></div><div class="rq">${c}</div><div class="rp">${nS.length?Math.round((c/nS.length)*100):0}%</div></div>`).join("")}
+</div>
+
+<div class="sec"><div class="sec-t">Histórico — ${services.length} registro${services.length!==1?"s":""}</div>
+${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
+:services.map(s=>`<div class="hi"><span class="ht">${fmtTime(s.startTime)}</span><span class="hname">${s.salespersonName}</span><span class="hout" style="color:${s.isSale?"#2D7A4F":"#B83232"}">${s.outcomeLabel}</span></div>`).join("")}
+</div>
+
+<div class="ft"><span>Via Íntima · ${storeName} · ${gD}</span><span>Sistema de Atendimento · ${gT}</span></div>
+</div></body></html>`;
+
+  const w=window.open("","_blank");
+  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
+}
