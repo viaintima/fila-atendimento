@@ -114,11 +114,10 @@ function seedDemandsFromOpening(openingIso,storeName){
   const closingHour=getClosingHour(storeName);
   const dayRef=new Date(openingIso);
   const at=(h,m=0)=>{const d=new Date(dayRef);d.setHours(h,m,0,0);return d.toISOString();};
-  const blank={assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE"};
+  const blank={assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE",createdAt:openingIso,completedAt:null};
   return [
     { id:uid(), code:"LIMPEZA",           type:"ABERTURA",   title:"Limpeza da loja",              description:"Piso, vitrine e provadores limpos antes da abertura.", dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
     { id:uid(), code:"CAIXA_ABERTURA",    type:"ABERTURA",   title:"Caixa conferido — Abertura",   description:"Fundo de caixa contado e registrado na abertura.",     dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
-    { id:uid(), code:"CAIXA_14H",         type:"FECHAMENTO", title:"Caixa conferido — 14h",        description:"Conferência de caixa do meio do dia.",                 dueAt:at(14,0), ...blank },
     { id:uid(), code:"PARCIAL",           type:"FECHAMENTO", title:"Envio de Parcial",             description:"Enviar o parcial do dia para a Supervisão.",           dueAt:at(16,0), ...blank },
     { id:uid(), code:"CAIXA_FECHAMENTO",  type:"FECHAMENTO", title:"Caixa conferido — Fechamento", description:"Fundo de caixa contado e registrado no fechamento.",   dueAt:at(closingHour,0), ...blank },
     { id:uid(), code:"FECHAMENTO",        type:"FECHAMENTO", title:"Envio de Fechamento",          description:`Enviar o fechamento do dia (escala desta loja: ${closingHour}h).`, dueAt:at(closingHour,0), ...blank },
@@ -488,7 +487,7 @@ function StoreApp({store,onLogout}) {
     await setDoc(sessionRef(store.id),{startedAt:fs||session?.startedAt||new Date().toISOString(),queue:nq??queue,services:ns??services,updatedAt:serverTimestamp()});
   };
   const closeDay=async()=>{
-    await setDoc(histDayRef(store.id,uid()),{startedAt:session?.startedAt||new Date().toISOString(),closedAt:new Date().toISOString(),queue,services});
+    await setDoc(histDayRef(store.id,uid()),{startedAt:session?.startedAt||new Date().toISOString(),closedAt:new Date().toISOString(),queue,services,demands});
     await setDoc(sessionRef(store.id),{startedAt:null,queue:[],services:[],updatedAt:serverTimestamp()});
     await setDoc(demandsRef(store.id),{items:[],updatedAt:serverTimestamp()});
     setSession(null);setQueue([]);setServices([]);setConfClose(false);setView("queue");setCurSvc(null);setDemands([]);
@@ -525,12 +524,13 @@ function StoreApp({store,onLogout}) {
     if(!activeTask||!taskWho)return;
     // Nada passa por aprovação da Supervisão — a loja marca como
     // realizada e a tarefa fecha na hora, com pontuação já definitiva.
-    const onTime=new Date()<=new Date(activeTask.dueAt);
+    const completedAt=new Date();
+    const onTime=completedAt<=new Date(activeTask.dueAt);
     const qualityBonus=taskNote.trim()?TASK_SCORE.QUALITY_BONUS:0;
     const status=onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA";
     const points=(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
 
-    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:points,completedBy:taskWho}:d);
+    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:points,completedBy:taskWho,completedAt:completedAt.toISOString()}:d);
 
     if(status==="CONCLUIDA_NO_PRAZO"&&activeTask.type!=="AVULSA"&&!taskBonus[activeTask.type]){
       const typeItems=updated.filter(d=>d.type===activeTask.type);
@@ -971,6 +971,7 @@ function AdminDashboard({onLogout}) {
   const [tab,setTab]=useState("overview");
   const [stores,setStores]=useState([]);
   const [sessions,setSessions]=useState({});
+  const [demandsLive,setDemandsLive]=useState({});
   const [histories,setHistories]=useState({});
   const [detailStore,setDetailStore]=useState(null);
   const [detailRec,setDetailRec]=useState(null);
@@ -993,6 +994,7 @@ function AdminDashboard({onLogout}) {
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
   useEffect(()=>{if(stores.length===0)return;const us=stores.map(s=>onSnapshot(sessionRef(s.id),snap=>{setSessions(prev=>({...prev,[s.id]:snap.exists()?snap.data():{queue:[],services:[]}}));}));return()=>us.forEach(u=>u());},[stores]);
+  useEffect(()=>{if(stores.length===0)return;const us=stores.map(s=>onSnapshot(demandsRef(s.id),snap=>{setDemandsLive(prev=>({...prev,[s.id]:snap.exists()?(snap.data().items||[]):[]}));}));return()=>us.forEach(u=>u());},[stores]);
 
   const loadHist=useCallback(async()=>{
     const data={};for(const s of stores){const snap=await getDocs(query(historyCol(s.id),orderBy("closedAt","desc")));data[s.id]=snap.docs.map(d=>({id:d.id,...d.data()}));}
@@ -1004,12 +1006,13 @@ function AdminDashboard({onLogout}) {
     if(!dFrom||!dTo||dStores.length===0){setDData(null);return;}
     setDBusy(true);
     const from=new Date(dFrom+"T00:00:00"),to=new Date(dTo+"T23:59:59");
-    const allSvcs=[],staffMap={},reasonMap={},storeMap={};
+    const allSvcs=[],staffMap={},reasonMap={},storeMap={},allDemands=[];
     const hC={};for(let h=8;h<=21;h++)hC[h]=0;
     dStores.forEach(sid=>{
       const st=stores.find(s=>s.id===sid);storeMap[sid]={name:st?.name||sid,svc:0,sales:0};
       const hist=allHist[sid]||[];const cur=sessions[sid];const allD=[...hist];
-      if(cur?.startedAt){const sd=new Date(cur.startedAt);if(sd>=from&&sd<=to)allD.push({...cur,id:"current"});}
+      let curInRange=false;
+      if(cur?.startedAt){const sd=new Date(cur.startedAt);if(sd>=from&&sd<=to){allD.push({...cur,id:"current"});curInRange=true;}}
       allD.forEach(day=>{
         const dd=new Date(day.startedAt);if(dd<from||dd>to)return;
         (day.services||[]).forEach(sv=>{
@@ -1020,7 +1023,10 @@ function AdminDashboard({onLogout}) {
           if(!staffMap[key])staffMap[key]={name:sv.salespersonName,store:st?.name||sid,svc:0,sales:0};
           staffMap[key].svc++;if(sv.isSale)staffMap[key].sales++;
         });
+        (day.demands||[]).forEach(d=>allDemands.push(d));
       });
+      // Demandas de hoje (ainda não fechadas) contam se a loja abriu dentro do período.
+      if(curInRange)(demandsLive[sid]||[]).forEach(d=>allDemands.push(d));
     });
     const tSvc=allSvcs.length,tSales=allSvcs.filter(s=>s.isSale).length;
     const conv=tSvc>0?Math.round((tSales/tSvc)*100):0;
@@ -1032,9 +1038,15 @@ function AdminDashboard({onLogout}) {
     const sortedH=Object.entries(hC).sort((a,b)=>parseInt(a)-parseInt(b));
     const maxH=Math.max(...sortedH.map(([,c])=>c),1);
     const peakH=sortedH.slice().sort((a,b)=>b[1]-a[1])[0];
-    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH});
+    // Tarefas com SLA — tempo de resolução (criação → conclusão) e % no prazo.
+    const doneTasks=allDemands.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA");
+    const resTimes=doneTasks.filter(d=>d.createdAt&&d.completedAt).map(d=>new Date(d.completedAt)-new Date(d.createdAt));
+    const avgResolution=resTimes.length?Math.round(resTimes.reduce((a,b)=>a+b,0)/resTimes.length/60000):0;
+    const onTimePct=doneTasks.length?Math.round((doneTasks.filter(d=>d.status==="CONCLUIDA_NO_PRAZO").length/doneTasks.length)*100):0;
+    const tTasksDone=doneTasks.length,tTasksLate=allDemands.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA").length;
+    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate});
     setDBusy(false);
-  },[dFrom,dTo,dStores,allHist,sessions,stores]);
+  },[dFrom,dTo,dStores,allHist,sessions,demandsLive,stores]);
 
   const mx=sid=>{const d=sessions[sid]||{queue:[],services:[]};const sv=d.services||[],q=d.queue||[];const sa=sv.filter(s=>s.isSale).length;return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length,queue:q,services:sv,startedAt:d.startedAt};};
   const actSt=stores.filter(s=>s.active!==false);
@@ -1166,6 +1178,18 @@ function AdminDashboard({onLogout}) {
             </div>
           ))}
         </div>
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
+          <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Tarefas (SLA)</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
+            {[{n:dData.tTasksDone,l:"Concluídas",c:VI.carvao},{n:dData.avgResolution>0?`${dData.avgResolution}'`:"—",l:"Tempo de resolução",c:VI.carvao},{n:dData.tTasksDone>0?`${dData.onTimePct}%`:"—",l:"No prazo",c:dData.onTimePct>=80?VI.green:dData.onTimePct>=50?VI.yellow:VI.red}].map((k,i)=>(
+              <div key={i} style={{textAlign:"center"}}>
+                <div style={{fontSize:20,fontWeight:700,color:k.c,letterSpacing:"-0.02em",lineHeight:1}}>{k.n}</div>
+                <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{k.l}</div>
+              </div>
+            ))}
+          </div>
+          {dData.tTasksLate>0&&<div style={{marginTop:12,fontSize:12,color:VI.red,display:"flex",alignItems:"center",gap:5}}><Icon name="clock" size={13} color={VI.red}/>{dData.tTasksLate} tarefa{dData.tTasksLate>1?"s":""} atrasada{dData.tTasksLate>1?"s":""} ou escalada{dData.tTasksLate>1?"s":""} no período (ainda em aberto).</div>}
+        </div>
         {dData.sortedStores.length>1&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
           <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Por loja</div>
           {dData.sortedStores.map((s,i)=>{const maxS=dData.sortedStores[0].sales||1;const cc=s.conv>=60?VI.green:s.conv>=40?VI.yellow:VI.red;return(
@@ -1267,6 +1291,7 @@ function AdminDashboard({onLogout}) {
 function SupervisaoDashboard({onLogout}) {
   const [stores,setStores]=useState([]);
   const [demandsMap,setDemandsMap]=useState({});
+  const [sessions,setSessions]=useState({});
   const [now,setNow]=useState(new Date());
   const [detailStore,setDetailStore]=useState(null);
   const [showNew,setShowNew]=useState(false);
@@ -1285,6 +1310,13 @@ function SupervisaoDashboard({onLogout}) {
     if(stores.length===0)return;
     const us=stores.map(s=>onSnapshot(demandsRef(s.id),snap=>{
       setDemandsMap(prev=>({...prev,[s.id]:snap.exists()?(snap.data().items||[]):[]}));
+    }));
+    return()=>us.forEach(u=>u());
+  },[stores]);
+  useEffect(()=>{
+    if(stores.length===0)return;
+    const us=stores.map(s=>onSnapshot(sessionRef(s.id),snap=>{
+      setSessions(prev=>({...prev,[s.id]:snap.exists()?snap.data():{queue:[],services:[]}}));
     }));
     return()=>us.forEach(u=>u());
   },[stores]);
@@ -1307,6 +1339,16 @@ function SupervisaoDashboard({onLogout}) {
   };
   const totals=stores.reduce((a,s)=>{const c=countsFor(s.id);a.pendentes+=c.pendentes;a.atrasadas+=c.atrasadas;a.concluidas+=c.concluidas;return a;},{pendentes:0,atrasadas:0,concluidas:0});
 
+  // KPIs de Fila de Vez (atendimento ao cliente), ao vivo, dia atual.
+  const mxQ=(sid)=>{
+    const d=sessions[sid]||{queue:[],services:[]};
+    const sv=d.services||[],q=d.queue||[];
+    const sa=sv.filter(s=>s.isSale).length;
+    return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length};
+  };
+  const queueTotals=stores.reduce((a,s)=>{const m=mxQ(s.id);a.svc+=m.svc;a.sales+=m.sales;return a;},{svc:0,sales:0});
+  const queueConv=queueTotals.svc>0?Math.round((queueTotals.sales/queueTotals.svc)*100):0;
+
   const openNew=(storeId)=>{
     setNewStoreId(storeId||"");setQuickIdx(null);setTitle("");setDescription("");setAssignTo("");
     const d=new Date(Date.now()+2*3600000);
@@ -1322,7 +1364,8 @@ function SupervisaoDashboard({onLogout}) {
     const dueAt=new Date(`${dueDate}T${dueTime}:00`).toISOString();
     const current=demandsMap[newStoreId]||[];
     // Demandas avulsas fecham direto quando a loja marca como realizada.
-    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:new Date().toISOString(),dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
+    const now=new Date().toISOString();
+    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:now,createdAt:now,completedAt:null,dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
     await setDoc(demandsRef(newStoreId),{items:[...current,item],updatedAt:serverTimestamp()});
     setSaving(false);setShowNew(false);
   };
@@ -1334,12 +1377,14 @@ function SupervisaoDashboard({onLogout}) {
       pendentes:items.filter(d=>d.status==="PENDENTE").sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt)),
       concluidas:items.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA"),
     };
+    const q=mxQ(detailStore.id);
     return(<AppShell>
       <Topbar title={detailStore.name} sub="Demandas da loja"
         actions={<>
           <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setDetailStore(null)}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn>
           <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>openNew(detailStore.id)}><Icon name="plus" size={13} color="#fff"/>Nova demanda</Btn>
         </>}/>
+      <StatsRow items={[{num:q.svc,label:"Atendimentos"},{num:q.sales,label:"Vendas",color:VI.green},{num:`${q.conv}%`,label:"Conversão"},{num:q.active,label:"Em turno"}]}/>
       <div style={{padding:"14px 22px 60px"}}>
         {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now}/>}
         <TaskSection title="Pendentes" items={groups.pendentes} now={now} empty="Nenhuma tarefa pendente"/>
@@ -1368,11 +1413,23 @@ function SupervisaoDashboard({onLogout}) {
         </div>
       ))}
     </div>
+
+    <div style={{margin:"14px 22px 0",background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 16px"}}>
+      <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:10}}>Fila de vez — hoje (todas as lojas)</div>
+      <div style={{display:"flex",gap:22}}>
+        {[{v:queueTotals.svc,l:"Atendimentos"},{v:queueTotals.sales,l:"Vendas",c:VI.green},{v:`${queueConv}%`,l:"Conversão",c:queueConv>=60?VI.green:queueConv>=40?VI.yellow:VI.red}].map(({v,l,c})=>(
+          <div key={l}><div style={{fontSize:20,fontWeight:700,color:c||VI.carvao,letterSpacing:"-0.02em"}}>{v}</div><div style={{fontSize:10,color:VI.muted,textTransform:"uppercase"}}>{l}</div></div>
+        ))}
+      </div>
+    </div>
+
     <div style={{padding:"18px 22px"}}>
       <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Lojas</div>
       {stores.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="store" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma loja cadastrada.</p></div>}
       {stores.map(s=>{
         const c=countsFor(s.id);
+        const q=mxQ(s.id);
+        const qc=q.conv>=60?VI.green:q.conv>=40?VI.yellow:VI.red;
         return(<div key={s.id} onClick={()=>setDetailStore(s)}
           style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:7,cursor:"pointer",transition:"border-color .2s"}}
           onMouseEnter={e=>e.currentTarget.style.borderColor=VI.terra}
@@ -1380,6 +1437,7 @@ function SupervisaoDashboard({onLogout}) {
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
+              {q.svc>0&&<div style={{display:"flex",gap:12}}>{[{v:q.svc,l:"Atend."},{v:q.sales,l:"Vendas",c:VI.green},{v:`${q.conv}%`,l:"Conv.",c:qc}].map(({v,l,c})=><div key={l} style={{textAlign:"center"}}><div style={{fontSize:15,fontWeight:700,color:c||VI.carvao}}>{v}</div><div style={{fontSize:9,color:VI.muted,textTransform:"uppercase"}}>{l}</div></div>)}</div>}
               {c.atrasadas>0&&<span style={{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:5,background:VI.redBg,color:VI.red}}>{c.atrasadas} atrasada{c.atrasadas>1?"s":""}</span>}
               <span style={{fontSize:12,color:VI.muted}}>{c.pendentes} pendente{c.pendentes!==1?"s":""}</span>
               <Icon name="chevR" size={15} color={VI.border}/>
@@ -1519,65 +1577,4 @@ tbody tr:last-child td{border-bottom:none}
 .rf{height:100%;background:#B5706A;border-radius:99px}
 .rq{flex:0 0 22px;font-weight:700;font-size:12px;text-align:right}
 .rp{flex:0 0 34px;font-size:11px;color:#9E7E78;text-align:right}
-.hcont{display:flex;align-items:flex-end;gap:4px;height:76px;margin-bottom:5px}
-.hcol{display:flex;flex-direction:column;align-items:center;gap:2px;flex:1}
-.hbar{width:100%;border-radius:2px 2px 0 0;min-height:2px}
-.hl{font-size:8px;color:#9E7E78}
-.hv{font-size:8px;font-weight:700;color:#9E7E78}
-.hi{display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #F5EDE8;font-size:12px}
-.hi:last-child{border-bottom:none}
-.ht{color:#9E7E78;flex:0 0 40px}.hname{flex:1;font-weight:500}.hout{flex:0 0 150px;text-align:right;font-size:11px;font-weight:500}
-.badge{display:inline-block;padding:1px 7px;border-radius:20px;font-size:9px;font-weight:700;background:#FDF6E3;color:#A07820;border:1px solid #C9A84C44}
-.ft{margin-top:36px;padding-top:12px;border-top:1px solid #EDD9D3;display:flex;justify-content:space-between;color:#9E7E78;font-size:11px}
-.nb{page-break-inside:avoid}
-@media print{.pg{padding:28px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-</style></head><body><div class="pg">
-
-<div class="rh">
-  <div><div class="brand">Via Íntima</div><h1>Relatório de Atendimentos</h1></div>
-  <div class="meta"><strong>${gD}</strong>${wD}<br>${storeName} · ${gT}</div>
-</div>
-
-<div class="sec nb"><div class="sec-t">Resumo Executivo</div>
-<div class="k4">
-  <div class="kp"><div class="kn">${tV}</div><div class="kl">Atendimentos</div></div>
-  <div class="kp gr"><div class="kn">${tSa}</div><div class="kl">Vendas</div><div class="ks">${nS.length} sem conversão</div></div>
-  <div class="kp dk"><div class="kn" style="color:${cr>=60?"#86efac":cr>=40?"#fde68a":"#fca5a5"}">${cr}%</div><div class="kl" style="color:#9E7E78">Conversão</div><div class="ks">${cr>=60?"Meta atingida":cr>=40?"Próximo da meta":"Abaixo da meta"}</div></div>
-  <div class="kp"><div class="kn">${aD>0?aD+"'":"—"}</div><div class="kl">Tempo Médio</div></div>
-</div>
-${(pk&&pk[1]>0)||best?`<div class="k2">
-  ${pk&&pk[1]>0?`<div class="kp am"><div class="kl" style="text-align:left">Horário de Pico</div><div style="font-size:15px;font-weight:700;margin-top:5px">${pk[0]}h – ${parseInt(pk[0])+1}h</div><div class="ks">${pk[1]} atendimento${pk[1]>1?"s":""}</div></div>`:"<div></div>"}
-  ${best?`<div class="kp am"><div class="kl" style="text-align:left">Destaque do Dia <span class="badge">★</span></div><div style="font-size:15px;font-weight:700;margin-top:5px">${best.name}</div><div class="ks">${best.pS} venda${best.pS!==1?"s":""} · ${best.pC}%</div></div>`:"<div></div>"}
-</div>`:""}
-</div>
-
-<div class="sec nb"><div class="sec-t">Performance por Funcionária</div>
-<table><thead><tr><th>Funcionária</th><th>Entrada</th><th>Saída</th><th>Expediente</th><th>Pausas</th><th class="tc">Atend.</th><th class="tc">Vendas</th><th>Conversão</th></tr></thead>
-<tbody>${st.map(p=>`<tr>
-  <td class="tn">${p.name}${p.pS===mSS&&mSS>0?" <span class='badge'>★</span>":""}</td>
-  <td class="td">${fmtTime(p.entryTime)}</td><td class="td">${p.exitTime?fmtTime(p.exitTime):"—"}</td>
-  <td class="td">${p.wS}</td><td class="td">${p.bS}</td>
-  <td class="tc" style="font-weight:600">${p.ps.length}</td><td class="tc tg">${p.pS}</td>
-  <td><div class="bar-wrap"><div class="bar-track">${bar(p.pC,100,cc(p.pC))}</div><span class="bar-lbl" style="color:${cc(p.pC)}">${p.pC}%</span></div></td>
-</tr>`).join("")}</tbody></table></div>
-
-${services.length>0?`<div class="sec nb"><div class="sec-t">Movimento por Hora</div>
-<div class="hcont">${hD.map(([h,c])=>{const ip=parseInt(h)===parseInt(pk?.[0])&&c>0;const bh=mH>0?Math.max((c/mH)*64,c>0?3:0):0;return`<div class="hcol"><div class="hv" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div style="flex:1;display:flex;align-items:flex-end;width:100%"><div class="hbar" style="height:${bh}px;background:${ip?"#B5706A":c>0?"#F2B5C0":"#EDD9D3"}"></div></div><div class="hl" style="color:${ip?"#B5706A":"#9E7E78"}">${h}h</div></div>`;}).join("")}</div>
-</div>`:""}
-
-<div class="sec nb"><div class="sec-t">Motivos de Não Venda</div>
-${sR.length===0?'<p style="color:#9E7E78;font-size:13px">Todos os atendimentos resultaram em venda.</p>'
-:sR.map(([l,c])=>`<div class="rb"><div class="rn">${l}</div><div class="rt"><div class="rf" style="width:${Math.round((c/mR)*100)}%"></div></div><div class="rq">${c}</div><div class="rp">${nS.length?Math.round((c/nS.length)*100):0}%</div></div>`).join("")}
-</div>
-
-<div class="sec"><div class="sec-t">Histórico — ${services.length} registro${services.length!==1?"s":""}</div>
-${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
-:services.map(s=>`<div class="hi"><span class="ht">${fmtTime(s.startTime)}</span><span class="hname">${s.salespersonName}</span><span class="hout" style="color:${s.isSale?"#2D7A4F":"#B83232"}">${s.outcomeLabel}</span></div>`).join("")}
-</div>
-
-<div class="ft"><span>Via Íntima · ${storeName} · ${gD}</span><span>Sistema de Atendimento · ${gT}</span></div>
-</div></body></html>`;
-
-  const w=window.open("","_blank");
-  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
-}
+.hcont{display:flex;align-items:flex-end;gap:4px;height:76px;marg
