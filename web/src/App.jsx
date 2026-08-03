@@ -66,7 +66,6 @@ const DEMAND_TYPES = {
 };
 const TASK_STATUS = {
   PENDENTE:              { label:"Pendente",                     color:VI.muted, bg:VI.surfaceAlt },
-  AGUARDANDO_APROVACAO:  { label:"Aguardando aprovação",          color:"#2563eb", bg:"#EFF6FF" },
   CONCLUIDA_NO_PRAZO:    { label:"Concluída",                     color:VI.green, bg:VI.greenBg },
   CONCLUIDA_ATRASADA:    { label:"Concluída (atrasada)",          color:VI.yellow, bg:VI.yellowBg },
   ATRASADA:              { label:"Atrasada",                      color:VI.red, bg:VI.redBg },
@@ -93,7 +92,6 @@ const QUICK_TASKS = [
   { title:"Arrumar sua seção",        description:"Organizar a seção de responsabilidade da vendedora." },
   { title:"Arrumar frente de loja",   description:"Organizar vitrine, entrada e fachada da loja." },
   { title:"Troca de vitrine",         description:"Trocar a vitrine conforme orientação da campanha." },
-  { title:"Limpeza de loja",          description:"Limpeza geral do salão de vendas." },
   { title:"Limpeza de estoque",       description:"Limpeza e organização da área de estoque." },
   { title:"Limpeza da copa",          description:"Limpeza da copa/área de descanso da equipe." },
   { title:"Limpeza do banheiro",      description:"Limpeza do banheiro da loja." },
@@ -109,14 +107,8 @@ const fmtElapsed = (sinceAt,now) => `solicitada há ${Math.max(0,Math.round((now
 
 // Semeia o checklist fixo do dia — as tarefas principais, automáticas.
 // Tudo o mais (vitrine, seção, limpeza pontual etc.) é demanda avulsa
-// criada pela Supervisão em SupervisaoDashboard.
-//
-// `code` identifica a tarefa de forma estável (independe do título) para
-// regras como "só Parcial e Fechamento pedem aprovação da Supervisão".
-// APPROVABLE_CODES = tarefas fixas que, quando concluídas, ficam
-// aguardando aprovação e mostram o botão "Aprovar" só para a Supervisão.
-const APPROVABLE_CODES = ["PARCIAL","FECHAMENTO"];
-
+// criada pela Supervisão em SupervisaoDashboard. Nenhuma tarefa passa por
+// aprovação — a loja marca como realizada e ela fecha na hora.
 function seedDemandsFromOpening(openingIso,storeName){
   const min=60000, opening=new Date(openingIso).getTime();
   const closingHour=getClosingHour(storeName);
@@ -124,12 +116,12 @@ function seedDemandsFromOpening(openingIso,storeName){
   const at=(h,m=0)=>{const d=new Date(dayRef);d.setHours(h,m,0,0);return d.toISOString();};
   const blank={assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE"};
   return [
-    { id:uid(), code:"LIMPEZA",           type:"ABERTURA",   title:"Limpeza da loja",              description:"Piso, vitrine e provadores limpos antes da abertura.", requiresReview:false, dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
-    { id:uid(), code:"CAIXA_ABERTURA",    type:"ABERTURA",   title:"Caixa conferido — Abertura",   description:"Fundo de caixa contado e registrado na abertura.",     requiresReview:false, dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
-    { id:uid(), code:"CAIXA_14H",         type:"FECHAMENTO", title:"Caixa conferido — 14h",        description:"Conferência de caixa do meio do dia.",                 requiresReview:false, dueAt:at(14,0), ...blank },
-    { id:uid(), code:"PARCIAL",           type:"FECHAMENTO", title:"Envio de Parcial",             description:"Enviar o parcial do dia para a Supervisão.",           requiresReview:true,  dueAt:at(16,0), ...blank },
-    { id:uid(), code:"CAIXA_FECHAMENTO",  type:"FECHAMENTO", title:"Caixa conferido — Fechamento", description:"Fundo de caixa contado e registrado no fechamento.",   requiresReview:false, dueAt:at(closingHour,0), ...blank },
-    { id:uid(), code:"FECHAMENTO",        type:"FECHAMENTO", title:"Envio de Fechamento",          description:`Enviar o fechamento do dia (escala desta loja: ${closingHour}h).`, requiresReview:true, dueAt:at(closingHour,0), ...blank },
+    { id:uid(), code:"LIMPEZA",           type:"ABERTURA",   title:"Limpeza da loja",              description:"Piso, vitrine e provadores limpos antes da abertura.", dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
+    { id:uid(), code:"CAIXA_ABERTURA",    type:"ABERTURA",   title:"Caixa conferido — Abertura",   description:"Fundo de caixa contado e registrado na abertura.",     dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
+    { id:uid(), code:"CAIXA_14H",         type:"FECHAMENTO", title:"Caixa conferido — 14h",        description:"Conferência de caixa do meio do dia.",                 dueAt:at(14,0), ...blank },
+    { id:uid(), code:"PARCIAL",           type:"FECHAMENTO", title:"Envio de Parcial",             description:"Enviar o parcial do dia para a Supervisão.",           dueAt:at(16,0), ...blank },
+    { id:uid(), code:"CAIXA_FECHAMENTO",  type:"FECHAMENTO", title:"Caixa conferido — Fechamento", description:"Fundo de caixa contado e registrado no fechamento.",   dueAt:at(closingHour,0), ...blank },
+    { id:uid(), code:"FECHAMENTO",        type:"FECHAMENTO", title:"Envio de Fechamento",          description:`Enviar o fechamento do dia (escala desta loja: ${closingHour}h).`, dueAt:at(closingHour,0), ...blank },
   ];
 }
 
@@ -531,16 +523,14 @@ function StoreApp({store,onLogout}) {
 
   const completeTask=async()=>{
     if(!activeTask||!taskWho)return;
-    // Pontualidade é sempre calculada no momento do envio pela loja — a
-    // aprovação da Supervisão pode vir depois sem penalizar quem cumpriu o prazo.
+    // Nada passa por aprovação da Supervisão — a loja marca como
+    // realizada e a tarefa fecha na hora, com pontuação já definitiva.
     const onTime=new Date()<=new Date(activeTask.dueAt);
     const qualityBonus=taskNote.trim()?TASK_SCORE.QUALITY_BONUS:0;
-    const finalStatus=onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA";
-    const finalPoints=(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
-    const status=activeTask.requiresReview?"AGUARDANDO_APROVACAO":finalStatus;
-    const basePoints=activeTask.requiresReview?0:finalPoints;
+    const status=onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA";
+    const points=(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
 
-    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:basePoints,completedBy:taskWho,submittedAt:new Date().toISOString(),pendingStatus:finalStatus,pendingPoints:finalPoints}:d);
+    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:points,completedBy:taskWho}:d);
 
     if(status==="CONCLUIDA_NO_PRAZO"&&activeTask.type!=="AVULSA"&&!taskBonus[activeTask.type]){
       const typeItems=updated.filter(d=>d.type===activeTask.type);
@@ -684,7 +674,6 @@ function StoreApp({store,onLogout}) {
   const taskGroups={
     atrasadas:demands.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA"),
     pendentes:demands.filter(d=>d.status==="PENDENTE").sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt)),
-    aguardando:demands.filter(d=>d.status==="AGUARDANDO_APROVACAO"),
     concluidas:demands.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA"),
   };
   const taskProgress=(type)=>{const items=demands.filter(d=>d.type===type);const done=items.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA").length;return{done,total:items.length};};
@@ -929,12 +918,11 @@ function TasksPanel({demands,now,groups,progress,nextTask,onOpenTask}) {
 
     {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now} onOpen={onOpenTask}/>}
     <TaskSection title="Pendentes" items={groups.pendentes} now={now} onOpen={onOpenTask} empty="Nenhuma tarefa pendente"/>
-    {groups.aguardando.length>0&&<TaskSection title="Aguardando aprovação" items={groups.aguardando} now={now}/>}
     {groups.concluidas.length>0&&<TaskSection title="Concluídas hoje" items={groups.concluidas} now={now} dim/>}
   </div>);
 }
 
-function TaskSection({title,items,now,onOpen,onApprove,dim,empty}) {
+function TaskSection({title,items,now,onOpen,dim,empty}) {
   return(<div style={{marginBottom:20,opacity:dim?.6:1}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
       <span style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted}}>{title}</span>
@@ -942,25 +930,21 @@ function TaskSection({title,items,now,onOpen,onApprove,dim,empty}) {
     </div>
     {items.length===0&&empty&&<div style={{textAlign:"center",padding:"24px 0",color:VI.muted,fontSize:13}}>{empty}</div>}
     <div style={{display:"flex",flexDirection:"column",gap:6}}>
-      {items.map(d=><TaskCard key={d.id} demand={d} now={now} onClick={onOpen?()=>onOpen(d):undefined} onApprove={onApprove?()=>onApprove(d):undefined}/>)}
+      {items.map(d=><TaskCard key={d.id} demand={d} now={now} onClick={onOpen?()=>onOpen(d):undefined}/>)}
     </div>
   </div>);
 }
 
-function TaskCard({demand,now,onClick,onApprove}) {
+function TaskCard({demand,now,onClick}) {
   const meta=DEMAND_TYPES[demand.type],statusMeta=TASK_STATUS[demand.status];
   const showCountdown=demand.status==="PENDENTE"||demand.status==="ATRASADA"||demand.status==="ESCALADA";
   const done=demand.status==="CONCLUIDA_NO_PRAZO"||demand.status==="CONCLUIDA_ATRASADA";
   const who=done?`concluída por ${demand.completedBy}`:(demand.assignedTo?`responsável: ${demand.assignedTo}`:"aberta à equipe");
-  // Só as tarefas de Envio de Parcial e Envio de Fechamento passam por
-  // aprovação da Supervisão — conferência de caixa e demandas avulsas
-  // fecham direto quando a loja marca como realizada.
-  const approvable=demand.status==="AGUARDANDO_APROVACAO"&&APPROVABLE_CODES.includes(demand.code)&&onApprove;
   return(
-    <div className="fi"
-      style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:10,display:"flex",alignItems:"stretch",overflow:"hidden"}}>
+    <div onClick={onClick} className="fi"
+      style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:10,display:"flex",alignItems:"stretch",overflow:"hidden",cursor:onClick?"pointer":"default"}}>
       <div style={{width:3,flexShrink:0,background:meta.color}}/>
-      <div onClick={onClick} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"11px 13px",gap:10,flex:1,cursor:onClick?"pointer":"default"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"11px 13px",gap:10,flex:1}}>
         <div style={{display:"flex",alignItems:"center",gap:9,flex:1,minWidth:0}}>
           <div style={{width:32,height:32,background:meta.bg,borderRadius:7,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
             <Icon name={meta.icon} size={15} color={meta.color}/>
@@ -979,10 +963,6 @@ function TaskCard({demand,now,onClick,onApprove}) {
         </div>
         <span style={{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:5,background:statusMeta.bg,color:statusMeta.color,whiteSpace:"nowrap",flexShrink:0}}>{statusMeta.label}</span>
       </div>
-      {approvable&&<button onClick={(e)=>{e.stopPropagation();onApprove();}}
-        style={{background:VI.green,border:"none",color:"#fff",fontSize:12,fontWeight:600,padding:"0 16px",cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,flexShrink:0}}>
-        <Icon name="check" size={13} color="#fff"/>Aprovar
-      </button>}
     </div>
   );
 }
@@ -1341,17 +1321,10 @@ function SupervisaoDashboard({onLogout}) {
     setSaving(true);
     const dueAt=new Date(`${dueDate}T${dueTime}:00`).toISOString();
     const current=demandsMap[newStoreId]||[];
-    // Demandas avulsas fecham direto quando a loja marca como realizada —
-    // a aprovação da Supervisão é só para Envio de Parcial e Fechamento.
-    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),requiresReview:false,assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:new Date().toISOString(),dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
+    // Demandas avulsas fecham direto quando a loja marca como realizada.
+    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:new Date().toISOString(),dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
     await setDoc(demandsRef(newStoreId),{items:[...current,item],updatedAt:serverTimestamp()});
     setSaving(false);setShowNew(false);
-  };
-
-  const approveDemand=async(storeId,demandId)=>{
-    const items=demandsMap[storeId]||[];
-    const updated=items.map(d=>d.id===demandId?{...d,status:d.pendingStatus||"CONCLUIDA_NO_PRAZO",pointsAwarded:d.pendingPoints||0}:d);
-    await setDoc(demandsRef(storeId),{items:updated,updatedAt:serverTimestamp()});
   };
 
   if(detailStore){
@@ -1359,7 +1332,6 @@ function SupervisaoDashboard({onLogout}) {
     const groups={
       atrasadas:items.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA"),
       pendentes:items.filter(d=>d.status==="PENDENTE").sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt)),
-      aguardando:items.filter(d=>d.status==="AGUARDANDO_APROVACAO"),
       concluidas:items.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA"),
     };
     return(<AppShell>
@@ -1371,7 +1343,6 @@ function SupervisaoDashboard({onLogout}) {
       <div style={{padding:"14px 22px 60px"}}>
         {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now}/>}
         <TaskSection title="Pendentes" items={groups.pendentes} now={now} empty="Nenhuma tarefa pendente"/>
-        {groups.aguardando.length>0&&<TaskSection title="Aguardando aprovação" items={groups.aguardando} now={now} onApprove={d=>approveDemand(detailStore.id,d.id)}/>}
         {groups.concluidas.length>0&&<TaskSection title="Concluídas hoje" items={groups.concluidas} now={now} dim/>}
       </div>
       {showNew&&<NewDemandModal stores={stores} storeId={newStoreId} setStoreId={setNewStoreId}
@@ -1610,4 +1581,3 @@ ${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
   const w=window.open("","_blank");
   if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
 }
-
