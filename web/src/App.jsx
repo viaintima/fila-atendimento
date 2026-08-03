@@ -1007,6 +1007,11 @@ function AdminDashboard({onLogout}) {
   const [pTo,setPTo]=useState("");
   const [pResult,setPResult]=useState(null);
   const [pBusy,setPBusy]=useState(false);
+  const [editDay,setEditDay]=useState(null);
+  const [editEntry,setEditEntry]=useState("");
+  const [editExit,setEditExit]=useState("");
+  const [editBreaks,setEditBreaks]=useState([]);
+  const [editSaving,setEditSaving]=useState(false);
   const [allHist,setAllHist]=useState({});
   const [showAdd,setShowAdd]=useState(false);
   const [newName,setNewName]=useState("");
@@ -1044,12 +1049,64 @@ function AdminDashboard({onLogout}) {
       const tM=en-new Date(p.entryTime);
       const bM=(p.breaks||[]).reduce((a,b)=>{const bE=b.end?new Date(b.end):new Date();return a+(bE-new Date(b.start));},0);
       const workedMin=Math.round(Math.max(0,tM-bM)/60000);
-      days.push({date:day.startedAt,entryTime:p.entryTime,exitTime:p.exitTime,breaks:p.breaks||[],workedMin});
+      days.push({date:day.startedAt,entryTime:p.entryTime,exitTime:p.exitTime,breaks:p.breaks||[],workedMin,dayId:day.id,isCurrent:day.id==="current"});
     });
     days.sort((a,b)=>new Date(b.date)-new Date(a.date));
     const totalWorkedMin=days.reduce((a,d)=>a+d.workedMin,0);
     setPResult({days,totalWorkedMin,daysCount:days.length});
     setPBusy(false);
+  };
+
+  // Correção manual de ponto — para quando esquecem de marcar entrada,
+  // saída ou o retorno de uma pausa.
+  const toHM=iso=>iso?new Date(iso).toTimeString().slice(0,5):"";
+  const openEditDay=(d)=>{
+    setEditDay(d);
+    setEditEntry(toHM(d.entryTime));
+    setEditExit(toHM(d.exitTime));
+    setEditBreaks(d.breaks.map(b=>({start:toHM(b.start),end:toHM(b.end)})));
+  };
+  const closeEditDay=()=>setEditDay(null);
+  const addEditBreak=()=>setEditBreaks(b=>[...b,{start:"",end:""}]);
+  const removeEditBreak=(i)=>setEditBreaks(b=>b.filter((_,idx)=>idx!==i));
+  const updateEditBreak=(i,field,val)=>setEditBreaks(b=>b.map((br,idx)=>idx===i?{...br,[field]:val}:br));
+  const saveEditDay=async()=>{
+    if(!editDay)return;
+    setEditSaving(true);
+    const combineDT=(hm)=>{
+      if(!hm)return null;
+      const d=new Date(editDay.date);const[h,m]=hm.split(":").map(Number);
+      d.setHours(h,m,0,0);return d.toISOString();
+    };
+    const newEntry=combineDT(editEntry)||editDay.entryTime;
+    const newExit=combineDT(editExit);
+    const newBreaks=editBreaks.map(b=>({start:combineDT(b.start),end:combineDT(b.end)})).filter(b=>b.start);
+
+    if(editDay.isCurrent){
+      const session=sessions[pStoreId];
+      if(session){
+        const nq=(session.queue||[]).map(p=>p.name===pName?{...p,entryTime:newEntry,exitTime:newExit,breaks:newBreaks}:p);
+        await setDoc(sessionRef(pStoreId),{...session,queue:nq,updatedAt:serverTimestamp()});
+      }
+    }else{
+      const day=(allHist[pStoreId]||[]).find(d=>d.id===editDay.dayId);
+      if(day){
+        const nq=(day.queue||[]).map(p=>p.name===pName?{...p,entryTime:newEntry,exitTime:newExit,breaks:newBreaks}:p);
+        await setDoc(histDayRef(pStoreId,editDay.dayId),{...day,queue:nq});
+        setAllHist(prev=>({...prev,[pStoreId]:(prev[pStoreId]||[]).map(d=>d.id===editDay.dayId?{...d,queue:nq}:d)}));
+      }
+    }
+
+    const en=newExit?new Date(newExit):new Date();
+    const tM=en-new Date(newEntry);
+    const bM=newBreaks.reduce((a,b)=>{const bE=b.end?new Date(b.end):new Date();return a+(bE-new Date(b.start));},0);
+    const workedMin=Math.round(Math.max(0,tM-bM)/60000);
+    setPResult(prev=>{
+      if(!prev)return prev;
+      const days=prev.days.map(d=>d.dayId===editDay.dayId?{...d,entryTime:newEntry,exitTime:newExit,breaks:newBreaks,workedMin}:d);
+      return{days,daysCount:days.length,totalWorkedMin:days.reduce((a,d)=>a+d.workedMin,0)};
+    });
+    setEditSaving(false);setEditDay(null);
   };
 
   const runDash=useCallback(()=>{
@@ -1345,29 +1402,72 @@ function AdminDashboard({onLogout}) {
       </div>
 
       {pResult&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-          <div style={{fontSize:14,fontWeight:600,color:VI.carvao}}>{pName}</div>
-          <div style={{display:"flex",gap:16,fontSize:12}}>
-            <span style={{color:VI.muted}}>{pResult.daysCount} dia{pResult.daysCount!==1?"s":""}</span>
-            <span style={{color:VI.terra,fontWeight:700}}>{Math.floor(pResult.totalWorkedMin/60)}h {pResult.totalWorkedMin%60}m total</span>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,gap:10,flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontSize:14,fontWeight:600,color:VI.carvao}}>{pName}</div>
+            <div style={{display:"flex",gap:16,fontSize:12,marginTop:2}}>
+              <span style={{color:VI.muted}}>{pResult.daysCount} dia{pResult.daysCount!==1?"s":""}</span>
+              <span style={{color:VI.terra,fontWeight:700}}>{Math.floor(pResult.totalWorkedMin/60)}h {pResult.totalWorkedMin%60}m total</span>
+            </div>
           </div>
+          <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPontoPDF(stores.find(s=>s.id===pStoreId)?.name||"",pName,new Date(pFrom+"T00:00:00"),new Date(pTo+"T23:59:59"),pResult.days,pResult.totalWorkedMin)}>
+            <Icon name="print" size={13} color={VI.muted}/>Exportar folha de ponto
+          </Btn>
         </div>
         {pResult.days.length===0&&<p style={{color:VI.muted,fontSize:13,textAlign:"center",padding:"20px 0"}}>Nenhum registro de ponto no período.</p>}
         {pResult.days.map((d,i)=>{
           const wh=Math.floor(d.workedMin/60),wm=d.workedMin%60;
-          return(<div key={i} style={{padding:"10px 0",borderBottom:i<pResult.days.length-1?`1px solid ${VI.border}`:"none"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-              <span style={{fontSize:13,fontWeight:500,color:VI.carvao,textTransform:"capitalize"}}>{fmtShort(d.date)}</span>
-              <span style={{fontSize:13,fontWeight:600,color:VI.carvao}}>{wh>0?`${wh}h ${wm}m`:`${wm}m`}</span>
+          return(<div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,padding:"10px 0",borderBottom:i<pResult.days.length-1?`1px solid ${VI.border}`:"none"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,gap:10}}>
+                <span style={{fontSize:13,fontWeight:500,color:VI.carvao,textTransform:"capitalize"}}>{fmtShort(d.date)}</span>
+                <span style={{fontSize:13,fontWeight:600,color:VI.carvao,flexShrink:0}}>{wh>0?`${wh}h ${wm}m`:`${wm}m`}</span>
+              </div>
+              <div style={{fontSize:12,color:VI.muted}}>
+                Entrada {fmtTime(d.entryTime)}
+                {d.breaks.map((b,j)=>` · Pausa ${j+1}: ${fmtTime(b.start)}–${b.end?fmtTime(b.end):"em andamento"}`)}
+                {d.exitTime?` · Saída ${fmtTime(d.exitTime)}`:" · ainda em turno"}
+                {(!d.exitTime||d.breaks.some(b=>!b.end))&&<span style={{color:VI.red,fontWeight:600}}> · marcação incompleta</span>}
+              </div>
             </div>
-            <div style={{fontSize:12,color:VI.muted}}>
-              Entrada {fmtTime(d.entryTime)}
-              {d.breaks.map((b,j)=>` · Pausa ${j+1}: ${fmtTime(b.start)}–${b.end?fmtTime(b.end):"em andamento"}`)}
-              {d.exitTime?` · Saída ${fmtTime(d.exitTime)}`:" · ainda em turno"}
-            </div>
+            <button onClick={()=>openEditDay(d)} title="Corrigir ponto" style={{background:"none",border:`1px solid ${VI.border}`,borderRadius:7,padding:"6px 9px",cursor:"pointer",display:"flex",alignItems:"center",flexShrink:0}}>
+              <Icon name="edit" size={13} color={VI.muted}/>
+            </button>
           </div>);
         })}
       </div>}
+
+      {editDay&&<Modal onClose={closeEditDay}>
+        <MIcon name="clock"/>
+        <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Corrigir ponto</h2>
+        <p style={{color:VI.muted,fontSize:13,marginBottom:18,textTransform:"capitalize"}}>{pName} · {fmtShort(editDay.date)}</p>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+          <div><div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Entrada</div>
+            <input type="time" value={editEntry} onChange={e=>setEditEntry(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/></div>
+          <div><div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Saída</div>
+            <input type="time" value={editExit} onChange={e=>setEditExit(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/></div>
+        </div>
+
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <div style={{fontSize:11,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.05em"}}>Pausas</div>
+          <button onClick={addEditBreak} style={{background:"none",border:"none",color:VI.terra,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:3}}><Icon name="plus" size={12} color={VI.terra}/>Adicionar</button>
+        </div>
+        {editBreaks.length===0&&<p style={{color:VI.muted,fontSize:12,marginBottom:10}}>Nenhuma pausa registrada.</p>}
+        {editBreaks.map((b,i)=>(
+          <div key={i} style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+            <input type="time" value={b.start} onChange={e=>updateEditBreak(i,"start",e.target.value)} style={{flex:1,background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"9px 10px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/>
+            <span style={{color:VI.muted,fontSize:12}}>até</span>
+            <input type="time" value={b.end} onChange={e=>updateEditBreak(i,"end",e.target.value)} style={{flex:1,background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"9px 10px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/>
+            <button onClick={()=>removeEditBreak(i)} style={{background:"none",border:"none",cursor:"pointer",padding:4,display:"flex",flexShrink:0}}><Icon name="x" size={13} color={VI.muted}/></button>
+          </div>
+        ))}
+
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:16}}>
+          <Btn variant="ghost" onClick={closeEditDay}>Cancelar</Btn>
+          <Btn variant="accent" disabled={!editEntry||editSaving} onClick={saveEditDay}>{editSaving?"Salvando…":"Salvar correção"}</Btn>
+        </div>
+      </Modal>}
     </div>}
 
     {tab==="stores"&&<div style={{padding:"18px 22px"}}>
@@ -1796,3 +1896,72 @@ ${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
   if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
 }
 
+function exportPontoPDF(storeName,personName,from,to,days,totalWorkedMin){
+  const gT=new Date().toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
+  const fD=d=>d.toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric"});
+  const wH=(m)=>Math.floor(m/60)>0?`${Math.floor(m/60)}h ${m%60}m`:`${m}m`;
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Folha de Ponto — ${personName}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Sans',sans-serif;color:#2C2020;font-size:13px;line-height:1.5;background:#fff}
+.pg{max-width:860px;margin:0 auto;padding:48px}
+.rh{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:18px;border-bottom:2px solid #F2B5C0;margin-bottom:28px}
+.brand{font-family:Georgia,serif;font-size:12px;font-weight:300;color:#B5706A;letter-spacing:.12em;text-transform:uppercase;margin-bottom:3px}
+.rh h1{font-size:21px;font-weight:600;letter-spacing:-.01em}
+.meta{text-align:right;color:#9E7E78;font-size:12px;line-height:1.8}
+.meta strong{color:#2C2020;font-size:14px;display:block;font-weight:600}
+.sec{margin-bottom:26px}
+.sec-t{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:#9E7E78;margin-bottom:11px;padding-bottom:6px;border-bottom:1px solid #EDD9D3}
+.k2{display:grid;grid-template-columns:repeat(2,1fr);gap:11px}
+.kp{border:1px solid #EDD9D3;border-radius:10px;padding:14px;background:#FDF0EC;text-align:center}
+.kn{font-size:26px;font-weight:700;color:#2C2020;letter-spacing:-.03em;line-height:1}
+.kl{font-size:10px;color:#9E7E78;margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+table{width:100%;border-collapse:collapse}
+thead th{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#9E7E78;padding:7px 9px;text-align:left;border-bottom:1px solid #EDD9D3}
+tbody td{padding:8px 9px;border-bottom:1px solid #F5EDE8;vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+.tn{font-weight:500;color:#2C2020;text-transform:capitalize}.tg{color:#2D7A4F;font-weight:600}.td{color:#9E7E78;font-size:11px}.tc{text-align:center}
+.ft{margin-top:36px;padding-top:12px;border-top:1px solid #EDD9D3;display:flex;justify-content:space-between;color:#9E7E78;font-size:11px}
+.sign{margin-top:56px;display:flex;justify-content:space-between;gap:40px}
+.sign div{flex:1;border-top:1px solid #2C2020;padding-top:6px;text-align:center;font-size:11px;color:#9E7E78}
+@media print{.pg{padding:28px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body><div class="pg">
+
+<div class="rh">
+  <div><div class="brand">Via Íntima</div><h1>Folha de Ponto</h1></div>
+  <div class="meta"><strong>${personName}</strong>${storeName}<br>${fD(from)} – ${fD(to)}</div>
+</div>
+
+<div class="sec nb"><div class="sec-t">Resumo do Período</div>
+<div class="k2">
+  <div class="kp"><div class="kn">${days.length}</div><div class="kl">Dias registrados</div></div>
+  <div class="kp"><div class="kn">${wH(totalWorkedMin)}</div><div class="kl">Total de horas</div></div>
+</div>
+</div>
+
+<div class="sec"><div class="sec-t">Registros diários</div>
+<table><thead><tr><th>Data</th><th>Entrada</th><th>Pausas</th><th>Saída</th><th class="tc">Horas</th></tr></thead>
+<tbody>${days.length===0?'<tr><td colspan="5" style="color:#9E7E78;padding:14px 9px">Nenhum registro no período.</td></tr>':days.slice().sort((a,b)=>new Date(a.date)-new Date(b.date)).map(d=>`<tr>
+  <td class="tn">${fmtShort(d.date)}</td>
+  <td class="td">${fmtTime(d.entryTime)}</td>
+  <td class="td">${d.breaks.length===0?"—":d.breaks.map(b=>`${fmtTime(b.start)}–${b.end?fmtTime(b.end):"…"}`).join(", ")}</td>
+  <td class="td">${d.exitTime?fmtTime(d.exitTime):"—"}</td>
+  <td class="tc tg">${wH(d.workedMin)}</td>
+</tr>`).join("")}</tbody></table>
+</div>
+
+<div class="sign">
+  <div>${personName}</div>
+  <div>Supervisão / Administração</div>
+</div>
+
+<div class="ft"><span>Via Íntima · ${storeName} · ${fD(from)} – ${fD(to)}</span><span>Folha de Ponto · gerado às ${gT}</span></div>
+</div></body></html>`;
+
+  const w=window.open("","_blank");
+  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
+}
+
+                        
