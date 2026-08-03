@@ -52,6 +52,51 @@ const sessionRef = id => doc(db,"sessions",id);
 const adminRef   = ()  => doc(db,"config","admin");
 const historyCol = id => collection(db,"history",id,"days");
 const histDayRef = (s,d) => doc(db,"history",s,"days",d);
+const demandsRef = id => doc(db,"demands",id);
+
+// ──────────────────────────────────────────
+// Tarefas com SLA — checklist de abertura/fechamento + demandas avulsas
+// da Supervisão. Ver Especificação_Funcional_Checklist_Inteligente v3.
+// ──────────────────────────────────────────
+const DEMAND_TYPES = {
+  ABERTURA:   { label:"Abertura",   icon:"sun",  color:VI.gold,  bg:VI.yellowBg },
+  FECHAMENTO: { label:"Fechamento", icon:"moon", color:VI.terra, bg:VI.surfaceAlt },
+  AVULSA:     { label:"Avulsa",     icon:"bell", color:VI.terra, bg:`${VI.blush}40` },
+};
+const TASK_STATUS = {
+  PENDENTE:              { label:"Pendente",                     color:VI.muted, bg:VI.surfaceAlt },
+  AGUARDANDO_APROVACAO:  { label:"Aguardando aprovação",          color:"#2563eb", bg:"#EFF6FF" },
+  CONCLUIDA_NO_PRAZO:    { label:"Concluída",                     color:VI.green, bg:VI.greenBg },
+  CONCLUIDA_ATRASADA:    { label:"Concluída (atrasada)",          color:VI.yellow, bg:VI.yellowBg },
+  ATRASADA:              { label:"Atrasada",                      color:VI.red, bg:VI.redBg },
+  ESCALADA:              { label:"Escalada · supervisão avisada", color:VI.red, bg:VI.redBg },
+};
+// Regras de pontuação — espelham a spec v3, §7 (gamificação por tarefa)
+const TASK_SCORE = { ON_TIME:10, QUALITY_BONUS:5, LATE:2, PERFECT:15 };
+// Prazo (min a partir da abertura) de cada item do checklist fixo — spec v3, §4
+const ABERTURA_SLA_MIN = { LIMPEZA:30, CAIXA:30, PRODUTOS_FOCO:60 };
+
+const fmtCountdown = (dueAt,now) => {
+  const m=Math.round((new Date(dueAt)-now)/60000);
+  return m>=0?`vence em ${m}min`:`atrasado há ${Math.abs(m)}min`;
+};
+const fmtElapsed = (sinceAt,now) => `solicitada há ${Math.max(0,Math.round((now-new Date(sinceAt))/60000))}min`;
+
+// Semeia o checklist fixo do dia a partir do horário real de abertura
+// (session.startedAt) — integra o SLA do checklist com a fila de vez.
+function seedDemandsFromOpening(openingIso){
+  const min=60000, opening=new Date(openingIso).getTime(), now=Date.now();
+  const blank={requiresReview:false,assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE"};
+  return [
+    {id:uid(),type:"ABERTURA",title:"Limpeza da loja",description:"Piso, vitrine e provadores limpos antes da abertura.",dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(),...blank},
+    {id:uid(),type:"ABERTURA",title:"Caixa conferido",description:"Fundo de caixa contado e registrado.",dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),...blank,requiresReview:true},
+    {id:uid(),type:"ABERTURA",title:"Produtos foco separados",description:"Peças da coleção foco do dia isoladas no salão.",dueAt:new Date(opening+ABERTURA_SLA_MIN.PRODUTOS_FOCO*min).toISOString(),...blank},
+    {id:uid(),type:"AVULSA",title:"Vitrine — trocar destaque",description:"Substituir o destaque da vitrine pelos itens da campanha da semana.",requestedAt:new Date(now-10*min).toISOString(),dueAt:new Date(now+35*min).toISOString(),...blank,sentBy:"Supervisão"},
+    {id:uid(),type:"FECHAMENTO",title:"Organização do salão",description:"Araras e prateleiras organizadas para o próximo turno.",dueAt:new Date(opening+360*min).toISOString(),...blank},
+    {id:uid(),type:"FECHAMENTO",title:"Divergências de caixa",description:"Registrar qualquer divergência encontrada no fechamento.",dueAt:new Date(opening+375*min).toISOString(),...blank,requiresReview:true},
+    {id:uid(),type:"FECHAMENTO",title:"Resumo do resultado",description:"Resumo de vendas do dia preenchido.",dueAt:new Date(opening+390*min).toISOString(),...blank},
+  ];
+}
 
 const Icon = ({ name, size=16, color="currentColor", sw=1.5 }) => {
   const p = {
@@ -79,6 +124,7 @@ const Icon = ({ name, size=16, color="currentColor", sw=1.5 }) => {
     cal:     <><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>,
     trend:   <><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></>,
     star:    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>,
+    list:    <><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></>,
   };
   return (
     <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24"
@@ -347,11 +393,24 @@ function StoreApp({store,onLogout}) {
   const [editSubD,setEditSubD]=useState("");
   const [now,setNow]=useState(new Date());
   const [ready,setReady]=useState(false);
+  const [demands,setDemands]=useState([]);
+  const [demandsReady,setDemandsReady]=useState(false);
+  const [activeTask,setActiveTask]=useState(null);
+  const [taskNote,setTaskNote]=useState("");
+  const [taskWho,setTaskWho]=useState("");
+  const [taskBonus,setTaskBonus]=useState({ABERTURA:false,FECHAMENTO:false});
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{
     const u=onSnapshot(storeRef(store.id),snap=>{
       if(snap.exists())setRoster(snap.data().roster||[]);
+    });
+    return()=>u();
+  },[store.id]);
+  useEffect(()=>{
+    const u=onSnapshot(demandsRef(store.id),snap=>{
+      setDemands(snap.exists()?(snap.data().items||[]):[]);
+      setDemandsReady(true);
     });
     return()=>u();
   },[store.id]);
@@ -370,7 +429,55 @@ function StoreApp({store,onLogout}) {
   const closeDay=async()=>{
     await setDoc(histDayRef(store.id,uid()),{startedAt:session?.startedAt||new Date().toISOString(),closedAt:new Date().toISOString(),queue,services});
     await setDoc(sessionRef(store.id),{startedAt:null,queue:[],services:[],updatedAt:serverTimestamp()});
-    setSession(null);setQueue([]);setServices([]);setConfClose(false);setView("queue");setCurSvc(null);
+    await setDoc(demandsRef(store.id),{items:[],updatedAt:serverTimestamp()});
+    setSession(null);setQueue([]);setServices([]);setConfClose(false);setView("queue");setCurSvc(null);setDemands([]);
+  };
+
+  // Semeia o checklist fixo assim que o dia começa (uma vez), com base no
+  // horário real de abertura — integra o SLA das tarefas com a fila de vez.
+  useEffect(()=>{
+    if(session?.startedAt && demandsReady && demands.length===0){
+      const seeded=seedDemandsFromOpening(session.startedAt);
+      setDemands(seeded);
+      setDoc(demandsRef(store.id),{items:seeded,updatedAt:serverTimestamp()});
+    }
+  },[session?.startedAt,demandsReady]);
+
+  // Escalonamento automático: pendências vencidas passam para a
+  // responsável e para a supervisão (spec v3, §4).
+  useEffect(()=>{
+    if(demands.some(d=>d.status==="PENDENTE"&&new Date(d.dueAt)<now)){
+      const upd=demands.map(d=>d.status==="PENDENTE"&&new Date(d.dueAt)<now?{...d,status:"ESCALADA"}:d);
+      setDemands(upd);
+      setDoc(demandsRef(store.id),{items:upd,updatedAt:serverTimestamp()});
+    }
+  },[now]);
+
+  const persistDemands=async(items)=>{
+    await setDoc(demandsRef(store.id),{items,updatedAt:serverTimestamp()});
+  };
+
+  const openTask=(d)=>{setActiveTask(d);setTaskNote("");setTaskWho("");};
+  const closeTask=()=>setActiveTask(null);
+
+  const completeTask=async()=>{
+    if(!activeTask||!taskWho)return;
+    const onTime=new Date()<=new Date(activeTask.dueAt);
+    const qualityBonus=taskNote.trim()?TASK_SCORE.QUALITY_BONUS:0;
+    const status=activeTask.requiresReview?"AGUARDANDO_APROVACAO":(onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA");
+    const basePoints=activeTask.requiresReview?0:(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
+
+    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:basePoints,completedBy:taskWho}:d);
+
+    if(status==="CONCLUIDA_NO_PRAZO"&&activeTask.type!=="AVULSA"&&!taskBonus[activeTask.type]){
+      const typeItems=updated.filter(d=>d.type===activeTask.type);
+      if(typeItems.every(d=>d.status==="CONCLUIDA_NO_PRAZO")){
+        updated=updated.map(d=>d.id===activeTask.id?{...d,pointsAwarded:d.pointsAwarded+TASK_SCORE.PERFECT}:d);
+        setTaskBonus(b=>({...b,[activeTask.type]:true}));
+      }
+    }
+
+    setDemands(updated);await persistDemands(updated);setActiveTask(null);
   };
 
   const aq=()=>[...queue].filter(p=>p.status!=="done").sort((a,b)=>{
@@ -501,17 +608,29 @@ function StoreApp({store,onLogout}) {
 
   const aqArr=aq(),dqArr=dq(),npObj=np();
 
+  const taskGroups={
+    atrasadas:demands.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA"),
+    pendentes:demands.filter(d=>d.status==="PENDENTE").sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt)),
+    aguardando:demands.filter(d=>d.status==="AGUARDANDO_APROVACAO"),
+    concluidas:demands.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA"),
+  };
+  const taskProgress=(type)=>{const items=demands.filter(d=>d.type===type);const done=items.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA").length;return{done,total:items.length};};
+  const nextTask=taskGroups.pendentes[0]||null;
+  const pointsToday=demands.reduce((s,d)=>s+(d.pointsAwarded||0),0);
+
   return(<AppShell>
     <Topbar title={store.name}
       sub={<><span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>{subSuffix(now)}</>}
       actions={<>
-        {view==="queue"?<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("report")}><Icon name="chart" size={13} color={VI.muted}/>Relatório</Btn>
-                       :<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("queue")}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}
+        {view!=="queue"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("queue")}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}
+        {view!=="report"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("report")}><Icon name="chart" size={13} color={VI.muted}/>Relatório</Btn>}
+        {view!=="tasks"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(taskGroups.atrasadas.length?{borderColor:VI.red,color:VI.red}:{})}} onClick={()=>setView("tasks")}><Icon name="list" size={13} color={taskGroups.atrasadas.length?VI.red:VI.muted}/>Tarefas{taskGroups.atrasadas.length>0?` (${taskGroups.atrasadas.length})`:""}</Btn>}
         {view==="report"&&<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(store.name,queue,services,session?.startedAt)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn><Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar dia</Btn></>}
         {view==="queue"&&<Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>{setAddPersonId("");setShowAdd(true);}}><Icon name="plus" size={13} color="#fff"/>Entrada</Btn>}
         <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,padding:"9px 10px"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
       </>}/>
-    <StatsRow items={[{num:tSvc,label:"Atendimentos"},{num:tSales,label:"Vendas",color:VI.green},{num:`${conv}%`,label:"Conversão"},{num:aqArr.filter(p=>p.status==="waiting").length,label:"Na fila"}]}/>
+    {view!=="tasks"&&<StatsRow items={[{num:tSvc,label:"Atendimentos"},{num:tSales,label:"Vendas",color:VI.green},{num:`${conv}%`,label:"Conversão"},{num:aqArr.filter(p=>p.status==="waiting").length,label:"Na fila"}]}/>}
+    {view==="tasks"&&<StatsRow items={[{num:taskGroups.pendentes.length,label:"Pendentes"},{num:taskGroups.atrasadas.length,label:"Atrasadas",color:taskGroups.atrasadas.length?VI.red:VI.carvao},{num:taskGroups.concluidas.length,label:"Concluídas",color:VI.green},{num:pointsToday,label:"Pontos hoje"}]}/>}
 
     <div style={{margin:"10px 22px 0",padding:"8px 12px",background:VI.surfaceAlt,borderRadius:8,fontSize:12,color:VI.muted,display:"flex",justifyContent:"space-between",alignItems:"center",border:`1px solid ${VI.border}`}}>
       <span>Dia iniciado às {fmtTime(session?.startedAt)}</span>
@@ -555,6 +674,10 @@ function StoreApp({store,onLogout}) {
       <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv} onEdit={s=>{setEditSvc(s);setEditStep("main");setEditSubD("");}}/>
     </>}
 
+    {view==="tasks"&&<TasksPanel
+      demands={demands} now={now} groups={taskGroups} progress={taskProgress}
+      nextTask={nextTask} onOpenTask={openTask}/>}
+
     {showAdd&&<Modal onClose={()=>setShowAdd(false)}><MIcon name="user"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Registrar entrada</h2><p style={{color:VI.muted,fontSize:13,marginBottom:18}}>Adicionar à fila de atendimento</p>
       {roster.length===0
         ?<p style={{color:VI.muted,fontSize:13,textAlign:"center",padding:"8px 0 18px"}}>Nenhuma vendedora cadastrada.<br/><span style={{fontSize:12,opacity:.7}}>Peça ao administrador para cadastrar a equipe desta loja.</span></p>
@@ -581,6 +704,34 @@ function StoreApp({store,onLogout}) {
     {editSvc&&<Modal onClose={()=>{setEditSvc(null);setEditStep("main");setEditSubD("");}}><MIcon name="edit"/><h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Editar atendimento</h2><p style={{color:VI.muted,fontSize:12,marginBottom:16}}>{editSvc.salespersonName} · {fmtTime(editSvc.startTime)}<br/><span style={{color:editSvc.isSale?VI.green:VI.red}}>Atual: {editSvc.outcomeLabel}</span></p>
       {editStep==="main"&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{MAIN_OUTCOMES.map(o=><button key={o.id} onClick={()=>o.id==="nao_vendeu"?setEditStep("sub"):editSvcFn(editSvc.id,o.id)} style={{background:o.isSale?VI.greenBg:VI.redBg,border:`1px solid ${o.color}44`,borderRadius:10,padding:"12px 14px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",fontFamily:"inherit"}}><span style={{fontSize:13,color:VI.carvao,fontWeight:500}}>{o.label}</span><Icon name={o.isSale?"check":"x"} size={15} color={o.color}/></button>)}</div>}
       {editStep==="sub"&&<><SubGrid selected={editSubD} onSelect={setEditSubD} onConfirm={(id,d)=>editSvcFn(editSvc.id,id,d)}/><Btn variant="ghost" style={{width:"100%",marginTop:8,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",gap:5}} onClick={()=>{setEditStep("main");setEditSubD("");}}><Icon name="back" size={12} color={VI.muted}/>Voltar</Btn></>}
+    </Modal>}
+
+    {activeTask&&<Modal onClose={closeTask}>
+      <MIcon name={DEMAND_TYPES[activeTask.type].icon} color={DEMAND_TYPES[activeTask.type].color} bg={DEMAND_TYPES[activeTask.type].bg}/>
+      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>{activeTask.title}</h2>
+      {activeTask.sentBy&&<p style={{fontSize:11,color:VI.terra,fontWeight:600,textTransform:"uppercase",letterSpacing:".3px",marginBottom:8}}>
+        enviada por {activeTask.sentBy}{activeTask.requestedAt&&` · ${fmtElapsed(activeTask.requestedAt,now)}`}
+      </p>}
+      <p style={{color:VI.muted,fontSize:13,marginBottom:10}}>{activeTask.description}</p>
+      <p style={{color:VI.muted,fontSize:12,marginBottom:16,fontStyle:"italic"}}>{fmtCountdown(activeTask.dueAt,now)}</p>
+
+      <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Quem está concluindo?</div>
+      {roster.length===0
+        ?<p style={{color:VI.muted,fontSize:13,marginBottom:12}}>Nenhuma vendedora cadastrada nesta loja.<br/><span style={{fontSize:12,opacity:.7}}>Peça ao administrador para cadastrar a equipe.</span></p>
+        :<select value={taskWho} onChange={e=>setTaskWho(e.target.value)} autoFocus
+            style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:taskWho?VI.carvao:VI.muted}}>
+            <option value="">Selecione a vendedora</option>
+            {roster.map(m=><option key={m.id} value={m.name}>{m.name}</option>)}
+          </select>}
+
+      <Inp placeholder="Observação (opcional)" value={taskNote} onChange={e=>setTaskNote(e.target.value)}/>
+
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+        <Btn variant="ghost" onClick={closeTask}>Cancelar</Btn>
+        <Btn variant="success" style={{display:"flex",alignItems:"center",gap:6}} disabled={!taskWho} onClick={completeTask}>
+          <Icon name="check" size={14} color="#fff"/> Marcar como concluída
+        </Btn>
+      </div>
     </Modal>}
   </AppShell>);
 }
@@ -676,6 +827,85 @@ function ReportView({services,queue,tSvc,tSales,conv,onEdit}) {
     </RSection>
   </div>);
 }
+function TasksPanel({demands,now,groups,progress,nextTask,onOpenTask}) {
+  const abertura=progress("ABERTURA"),fechamento=progress("FECHAMENTO");
+  return(<div style={{padding:"14px 22px 60px"}}>
+    <button disabled={!nextTask} onClick={()=>nextTask&&onOpenTask(nextTask)}
+      style={{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",background:VI.carvao,
+              border:"none",borderRadius:12,padding:"16px 18px",color:VI.cream,cursor:nextTask?"pointer":"not-allowed",
+              opacity:nextTask?1:.35,fontFamily:"inherit",transition:"opacity .2s",marginBottom:14}}>
+      <span style={{fontSize:15,fontWeight:600}}>Realizar tarefa</span>
+      {nextTask
+        ?<span style={{fontSize:12,color:VI.blush,display:"flex",alignItems:"center",gap:4}}><Icon name="chevR" size={12} color={VI.blush}/>{nextTask.title}</span>
+        :<span style={{fontSize:12,color:VI.muted}}>Nenhuma pendente</span>}
+    </button>
+
+    <div style={{display:"flex",gap:10,marginBottom:16}}>
+      {[["Abertura",abertura,VI.gold],["Fechamento",fechamento,VI.terra]].map(([label,p,color])=>{
+        const pct=p.total?Math.round((p.done/p.total)*100):0;
+        return(<div key={label} style={{flex:1,background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"12px 14px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:6}}>
+            <span style={{color:VI.carvao,fontWeight:500}}>{label}</span><span style={{color:VI.muted}}>{p.done}/{p.total}</span>
+          </div>
+          <div style={{height:5,background:VI.surfaceAlt,borderRadius:99,overflow:"hidden"}}>
+            <div style={{height:"100%",width:`${pct}%`,background:color,borderRadius:99,transition:"width .4s"}}/>
+          </div>
+        </div>);
+      })}
+    </div>
+
+    {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now} onOpen={onOpenTask}/>}
+    <TaskSection title="Pendentes" items={groups.pendentes} now={now} onOpen={onOpenTask} empty="Nenhuma tarefa pendente"/>
+    {groups.aguardando.length>0&&<TaskSection title="Aguardando aprovação" items={groups.aguardando} now={now}/>}
+    {groups.concluidas.length>0&&<TaskSection title="Concluídas hoje" items={groups.concluidas} now={now} dim/>}
+  </div>);
+}
+
+function TaskSection({title,items,now,onOpen,dim,empty}) {
+  return(<div style={{marginBottom:20,opacity:dim?.6:1}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+      <span style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted}}>{title}</span>
+      <span style={{fontSize:11,background:VI.surfaceAlt,color:VI.muted,padding:"2px 8px",borderRadius:99,border:`1px solid ${VI.border}`}}>{items.length}</span>
+    </div>
+    {items.length===0&&empty&&<div style={{textAlign:"center",padding:"24px 0",color:VI.muted,fontSize:13}}>{empty}</div>}
+    <div style={{display:"flex",flexDirection:"column",gap:6}}>
+      {items.map(d=><TaskCard key={d.id} demand={d} now={now} onClick={onOpen?()=>onOpen(d):undefined}/>)}
+    </div>
+  </div>);
+}
+
+function TaskCard({demand,now,onClick}) {
+  const meta=DEMAND_TYPES[demand.type],statusMeta=TASK_STATUS[demand.status];
+  const showCountdown=demand.status==="PENDENTE"||demand.status==="ATRASADA"||demand.status==="ESCALADA";
+  const done=demand.status==="CONCLUIDA_NO_PRAZO"||demand.status==="CONCLUIDA_ATRASADA";
+  const who=done?`concluída por ${demand.completedBy}`:(demand.assignedTo?`responsável: ${demand.assignedTo}`:"aberta à equipe");
+  return(
+    <div onClick={onClick} className="fi"
+      style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:10,display:"flex",alignItems:"stretch",overflow:"hidden",cursor:onClick?"pointer":"default"}}>
+      <div style={{width:3,flexShrink:0,background:meta.color}}/>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"11px 13px",gap:10,flex:1}}>
+        <div style={{display:"flex",alignItems:"center",gap:9,flex:1,minWidth:0}}>
+          <div style={{width:32,height:32,background:meta.bg,borderRadius:7,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <Icon name={meta.icon} size={15} color={meta.color}/>
+          </div>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:14,fontWeight:500,color:VI.carvao,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+              {demand.title}
+              {demand.sentBy&&<span style={{marginLeft:8,fontSize:10,color:VI.terra,fontWeight:600,textTransform:"uppercase",letterSpacing:".3px"}}>enviada por {demand.sentBy}</span>}
+            </div>
+            <div style={{fontSize:11,color:VI.muted,marginTop:1}}>
+              {meta.label} · {who}
+              {demand.requestedAt&&showCountdown&&` · ${fmtElapsed(demand.requestedAt,now)}`}
+              {showCountdown&&` · ${fmtCountdown(demand.dueAt,now)}`}
+            </div>
+          </div>
+        </div>
+        <span style={{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:5,background:statusMeta.bg,color:statusMeta.color,whiteSpace:"nowrap",flexShrink:0}}>{statusMeta.label}</span>
+      </div>
+    </div>
+  );
+}
+
 function AdminDashboard({onLogout}) {
   const [tab,setTab]=useState("overview");
   const [stores,setStores]=useState([]);
