@@ -50,6 +50,7 @@ const ini      = n   => n.trim().split(" ").map(w=>w[0]).slice(0,2).join("").toU
 const storeRef   = id => doc(db,"stores",id);
 const sessionRef = id => doc(db,"sessions",id);
 const adminRef   = ()  => doc(db,"config","admin");
+const supervisaoRef = () => doc(db,"config","supervisao");
 const historyCol = id => collection(db,"history",id,"days");
 const histDayRef = (s,d) => doc(db,"history",s,"days",d);
 const demandsRef = id => doc(db,"demands",id);
@@ -73,8 +74,32 @@ const TASK_STATUS = {
 };
 // Regras de pontuação — espelham a spec v3, §7 (gamificação por tarefa)
 const TASK_SCORE = { ON_TIME:10, QUALITY_BONUS:5, LATE:2, PERFECT:15 };
-// Prazo (min a partir da abertura) de cada item do checklist fixo — spec v3, §4
-const ABERTURA_SLA_MIN = { LIMPEZA:30, CAIXA:30, PRODUTOS_FOCO:60 };
+// Prazo (min a partir da abertura) das tarefas de abertura — spec v3, §4
+const ABERTURA_SLA_MIN = { LIMPEZA:30, CAIXA:30 };
+// Escala de horário de fechamento por loja — ajuste aqui conforme a escala real.
+const STORE_CLOSING_HOUR = {
+  "centro": 19,
+  "shopping icaraí": 19,
+  "shopping icarai": 19,
+  "center iv": 22,
+  "itaipu": 22,
+};
+const getClosingHour = (storeName="") => STORE_CLOSING_HOUR[storeName.trim().toLowerCase()] ?? 21; // padrão se a loja não estiver na escala
+
+// Menu rápido de demandas avulsas — o dia a dia que a Supervisão manda,
+// além das 4 tarefas principais automáticas. Pode ser designado a uma
+// vendedora específica ou deixado aberto à loja.
+const QUICK_TASKS = [
+  { title:"Arrumar sua seção",        description:"Organizar a seção de responsabilidade da vendedora." },
+  { title:"Arrumar frente de loja",   description:"Organizar vitrine, entrada e fachada da loja." },
+  { title:"Troca de vitrine",         description:"Trocar a vitrine conforme orientação da campanha." },
+  { title:"Limpeza de loja",          description:"Limpeza geral do salão de vendas." },
+  { title:"Limpeza de estoque",       description:"Limpeza e organização da área de estoque." },
+  { title:"Limpeza da copa",          description:"Limpeza da copa/área de descanso da equipe." },
+  { title:"Limpeza do banheiro",      description:"Limpeza do banheiro da loja." },
+  { title:"Reposição direcionada",    description:"Repor os itens indicados pela Supervisão." },
+  { title:"Comunicado de campanha",   description:"Repassar a informação da campanha vigente para a equipe." },
+];
 
 const fmtCountdown = (dueAt,now) => {
   const m=Math.round((new Date(dueAt)-now)/60000);
@@ -82,19 +107,29 @@ const fmtCountdown = (dueAt,now) => {
 };
 const fmtElapsed = (sinceAt,now) => `solicitada há ${Math.max(0,Math.round((now-new Date(sinceAt))/60000))}min`;
 
-// Semeia o checklist fixo do dia a partir do horário real de abertura
-// (session.startedAt) — integra o SLA do checklist com a fila de vez.
-function seedDemandsFromOpening(openingIso){
-  const min=60000, opening=new Date(openingIso).getTime(), now=Date.now();
-  const blank={requiresReview:false,assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE"};
+// Semeia o checklist fixo do dia — as tarefas principais, automáticas.
+// Tudo o mais (vitrine, seção, limpeza pontual etc.) é demanda avulsa
+// criada pela Supervisão em SupervisaoDashboard.
+//
+// `code` identifica a tarefa de forma estável (independe do título) para
+// regras como "só Parcial e Fechamento pedem aprovação da Supervisão".
+// APPROVABLE_CODES = tarefas fixas que, quando concluídas, ficam
+// aguardando aprovação e mostram o botão "Aprovar" só para a Supervisão.
+const APPROVABLE_CODES = ["PARCIAL","FECHAMENTO"];
+
+function seedDemandsFromOpening(openingIso,storeName){
+  const min=60000, opening=new Date(openingIso).getTime();
+  const closingHour=getClosingHour(storeName);
+  const dayRef=new Date(openingIso);
+  const at=(h,m=0)=>{const d=new Date(dayRef);d.setHours(h,m,0,0);return d.toISOString();};
+  const blank={assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE"};
   return [
-    {id:uid(),type:"ABERTURA",title:"Limpeza da loja",description:"Piso, vitrine e provadores limpos antes da abertura.",dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(),...blank},
-    {id:uid(),type:"ABERTURA",title:"Caixa conferido",description:"Fundo de caixa contado e registrado.",dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),...blank,requiresReview:true},
-    {id:uid(),type:"ABERTURA",title:"Produtos foco separados",description:"Peças da coleção foco do dia isoladas no salão.",dueAt:new Date(opening+ABERTURA_SLA_MIN.PRODUTOS_FOCO*min).toISOString(),...blank},
-    {id:uid(),type:"AVULSA",title:"Vitrine — trocar destaque",description:"Substituir o destaque da vitrine pelos itens da campanha da semana.",requestedAt:new Date(now-10*min).toISOString(),dueAt:new Date(now+35*min).toISOString(),...blank,sentBy:"Supervisão"},
-    {id:uid(),type:"FECHAMENTO",title:"Organização do salão",description:"Araras e prateleiras organizadas para o próximo turno.",dueAt:new Date(opening+360*min).toISOString(),...blank},
-    {id:uid(),type:"FECHAMENTO",title:"Divergências de caixa",description:"Registrar qualquer divergência encontrada no fechamento.",dueAt:new Date(opening+375*min).toISOString(),...blank,requiresReview:true},
-    {id:uid(),type:"FECHAMENTO",title:"Resumo do resultado",description:"Resumo de vendas do dia preenchido.",dueAt:new Date(opening+390*min).toISOString(),...blank},
+    { id:uid(), code:"LIMPEZA",           type:"ABERTURA",   title:"Limpeza da loja",              description:"Piso, vitrine e provadores limpos antes da abertura.", requiresReview:false, dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
+    { id:uid(), code:"CAIXA_ABERTURA",    type:"ABERTURA",   title:"Caixa conferido — Abertura",   description:"Fundo de caixa contado e registrado na abertura.",     requiresReview:false, dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
+    { id:uid(), code:"CAIXA_14H",         type:"FECHAMENTO", title:"Caixa conferido — 14h",        description:"Conferência de caixa do meio do dia.",                 requiresReview:false, dueAt:at(14,0), ...blank },
+    { id:uid(), code:"PARCIAL",           type:"FECHAMENTO", title:"Envio de Parcial",             description:"Enviar o parcial do dia para a Supervisão.",           requiresReview:true,  dueAt:at(16,0), ...blank },
+    { id:uid(), code:"CAIXA_FECHAMENTO",  type:"FECHAMENTO", title:"Caixa conferido — Fechamento", description:"Fundo de caixa contado e registrado no fechamento.",   requiresReview:false, dueAt:at(closingHour,0), ...blank },
+    { id:uid(), code:"FECHAMENTO",        type:"FECHAMENTO", title:"Envio de Fechamento",          description:`Enviar o fechamento do dia (escala desta loja: ${closingHour}h).`, requiresReview:true, dueAt:at(closingHour,0), ...blank },
   ];
 }
 
@@ -254,13 +289,14 @@ export default function App() {
   const [screen,setScreen]=useState("login");
   const [store,setStore]=useState(null);
   return (<>
-    {screen==="login"&&<LoginPage onStore={s=>{setStore(s);setScreen("store");}} onAdmin={()=>setScreen("admin")}/>}
+    {screen==="login"&&<LoginPage onStore={s=>{setStore(s);setScreen("store");}} onAdmin={()=>setScreen("admin")} onSupervisao={()=>setScreen("supervisao")}/>}
     {screen==="store"&&<StoreApp store={store} onLogout={()=>{setStore(null);setScreen("login");}}/>}
     {screen==="admin"&&<AdminDashboard onLogout={()=>setScreen("login")}/>}
+    {screen==="supervisao"&&<SupervisaoDashboard onLogout={()=>setScreen("login")}/>}
   </>);
 }
 
-function LoginPage({onStore,onAdmin}) {
+function LoginPage({onStore,onAdmin,onSupervisao}) {
   const [tab,setTab]=useState("store");
   const [stores,setStores]=useState([]);
   const [storeId,setStoreId]=useState("");
@@ -268,6 +304,9 @@ function LoginPage({onStore,onAdmin}) {
   const [adminPin,setAdminPin]=useState("");
   const [newAdminPin,setNewAdminPin]=useState("");
   const [firstRun,setFirstRun]=useState(null);
+  const [supPin,setSupPin]=useState("");
+  const [newSupPin,setNewSupPin]=useState("");
+  const [firstRunSup,setFirstRunSup]=useState(null);
   const [err,setErr]=useState("");
   const [busy,setBusy]=useState(false);
 
@@ -278,6 +317,7 @@ function LoginPage({onStore,onAdmin}) {
     return()=>u();
   },[]);
   useEffect(()=>{getDoc(adminRef()).then(d=>setFirstRun(!d.exists()));},[]);
+  useEffect(()=>{getDoc(supervisaoRef()).then(d=>setFirstRunSup(!d.exists()));},[]);
 
   const loginStore=async()=>{
     setErr("");setBusy(true);
@@ -298,8 +338,19 @@ function LoginPage({onStore,onAdmin}) {
     if(newAdminPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
     await setDoc(adminRef(),{pin:newAdminPin}); onAdmin();
   };
+  const loginSupervisao=async()=>{
+    setErr("");setBusy(true);
+    if(!supPin){setErr("Digite o PIN.");setBusy(false);return;}
+    const snap=await getDoc(supervisaoRef());
+    if(!snap.exists()||snap.data().pin!==supPin){setErr("PIN incorreto.");setBusy(false);return;}
+    onSupervisao();
+  };
+  const createSupPin=async()=>{
+    if(newSupPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
+    await setDoc(supervisaoRef(),{pin:newSupPin}); onSupervisao();
+  };
 
-  if(firstRun===null) return (
+  if(firstRun===null||firstRunSup===null) return (
     <div style={{minHeight:"100vh",background:VI.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
       <style>{CSS}</style>
       <div style={{width:24,height:24,border:`2px solid ${VI.border}`,borderTopColor:VI.terra,borderRadius:"50%",animation:"spin .7s linear infinite"}}/>
@@ -319,7 +370,7 @@ function LoginPage({onStore,onAdmin}) {
         </div>
 
         <div style={{display:"flex",background:VI.surface,borderRadius:10,padding:3,marginBottom:18,border:`1px solid ${VI.border}`}}>
-          {[["store","Loja"],["admin","Administrador"]].map(([t,l])=>(
+          {[["store","Loja"],["supervisao","Supervisão"],["admin","Administrador"]].map(([t,l])=>(
             <button key={t} onClick={()=>{setTab(t);setErr("");}}
               style={{flex:1,padding:"10px 0",border:"none",borderRadius:8,fontFamily:"inherit",fontSize:13,fontWeight:500,cursor:"pointer",
                       background:tab===t?VI.terra:"transparent",color:tab===t?"#fff":VI.muted,transition:"all .2s"}}>
@@ -351,6 +402,24 @@ function LoginPage({onStore,onAdmin}) {
               {busy?"Verificando…":"Entrar"}
             </Btn>
           </>}
+          {tab==="supervisao"&&(firstRunSup
+            ?<>
+               <p style={{color:VI.muted,fontSize:13,marginBottom:16,lineHeight:1.6}}>Primeira vez — crie o PIN de supervisão.</p>
+               <Inp type="password" placeholder="Criar PIN (mín. 4 dígitos)" value={newSupPin}
+                    onChange={e=>setNewSupPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&createSupPin()}/>
+               {err&&<p style={{color:VI.red,fontSize:12,marginBottom:10}}>{err}</p>}
+               <Btn variant="primary" style={{width:"100%"}} onClick={createSupPin}>Criar PIN e entrar</Btn>
+             </>
+            :<>
+               <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>PIN de supervisão</p>
+               <Inp type="password" placeholder="PIN de supervisão" value={supPin} autoFocus
+                    onChange={e=>setSupPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&loginSupervisao()}/>
+               {err&&<p style={{color:VI.red,fontSize:12,marginBottom:10}}>{err}</p>}
+               <Btn variant="primary" style={{width:"100%"}} disabled={busy} onClick={loginSupervisao}>
+                 {busy?"Verificando…":"Acessar painel"}
+               </Btn>
+             </>
+          )}
           {tab==="admin"&&(firstRun
             ?<>
                <p style={{color:VI.muted,fontSize:13,marginBottom:16,lineHeight:1.6}}>Primeira vez — crie o PIN de administrador.</p>
@@ -437,7 +506,7 @@ function StoreApp({store,onLogout}) {
   // horário real de abertura — integra o SLA das tarefas com a fila de vez.
   useEffect(()=>{
     if(session?.startedAt && demandsReady && demands.length===0){
-      const seeded=seedDemandsFromOpening(session.startedAt);
+      const seeded=seedDemandsFromOpening(session.startedAt,store.name);
       setDemands(seeded);
       setDoc(demandsRef(store.id),{items:seeded,updatedAt:serverTimestamp()});
     }
@@ -462,12 +531,16 @@ function StoreApp({store,onLogout}) {
 
   const completeTask=async()=>{
     if(!activeTask||!taskWho)return;
+    // Pontualidade é sempre calculada no momento do envio pela loja — a
+    // aprovação da Supervisão pode vir depois sem penalizar quem cumpriu o prazo.
     const onTime=new Date()<=new Date(activeTask.dueAt);
     const qualityBonus=taskNote.trim()?TASK_SCORE.QUALITY_BONUS:0;
-    const status=activeTask.requiresReview?"AGUARDANDO_APROVACAO":(onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA");
-    const basePoints=activeTask.requiresReview?0:(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
+    const finalStatus=onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA";
+    const finalPoints=(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
+    const status=activeTask.requiresReview?"AGUARDANDO_APROVACAO":finalStatus;
+    const basePoints=activeTask.requiresReview?0:finalPoints;
 
-    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:basePoints,completedBy:taskWho}:d);
+    let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:basePoints,completedBy:taskWho,submittedAt:new Date().toISOString(),pendingStatus:finalStatus,pendingPoints:finalPoints}:d);
 
     if(status==="CONCLUIDA_NO_PRAZO"&&activeTask.type!=="AVULSA"&&!taskBonus[activeTask.type]){
       const typeItems=updated.filter(d=>d.type===activeTask.type);
@@ -861,7 +934,7 @@ function TasksPanel({demands,now,groups,progress,nextTask,onOpenTask}) {
   </div>);
 }
 
-function TaskSection({title,items,now,onOpen,dim,empty}) {
+function TaskSection({title,items,now,onOpen,onApprove,dim,empty}) {
   return(<div style={{marginBottom:20,opacity:dim?.6:1}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
       <span style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted}}>{title}</span>
@@ -869,21 +942,25 @@ function TaskSection({title,items,now,onOpen,dim,empty}) {
     </div>
     {items.length===0&&empty&&<div style={{textAlign:"center",padding:"24px 0",color:VI.muted,fontSize:13}}>{empty}</div>}
     <div style={{display:"flex",flexDirection:"column",gap:6}}>
-      {items.map(d=><TaskCard key={d.id} demand={d} now={now} onClick={onOpen?()=>onOpen(d):undefined}/>)}
+      {items.map(d=><TaskCard key={d.id} demand={d} now={now} onClick={onOpen?()=>onOpen(d):undefined} onApprove={onApprove?()=>onApprove(d):undefined}/>)}
     </div>
   </div>);
 }
 
-function TaskCard({demand,now,onClick}) {
+function TaskCard({demand,now,onClick,onApprove}) {
   const meta=DEMAND_TYPES[demand.type],statusMeta=TASK_STATUS[demand.status];
   const showCountdown=demand.status==="PENDENTE"||demand.status==="ATRASADA"||demand.status==="ESCALADA";
   const done=demand.status==="CONCLUIDA_NO_PRAZO"||demand.status==="CONCLUIDA_ATRASADA";
   const who=done?`concluída por ${demand.completedBy}`:(demand.assignedTo?`responsável: ${demand.assignedTo}`:"aberta à equipe");
+  // Só as tarefas de Envio de Parcial e Envio de Fechamento passam por
+  // aprovação da Supervisão — conferência de caixa e demandas avulsas
+  // fecham direto quando a loja marca como realizada.
+  const approvable=demand.status==="AGUARDANDO_APROVACAO"&&APPROVABLE_CODES.includes(demand.code)&&onApprove;
   return(
-    <div onClick={onClick} className="fi"
-      style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:10,display:"flex",alignItems:"stretch",overflow:"hidden",cursor:onClick?"pointer":"default"}}>
+    <div className="fi"
+      style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:10,display:"flex",alignItems:"stretch",overflow:"hidden"}}>
       <div style={{width:3,flexShrink:0,background:meta.color}}/>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"11px 13px",gap:10,flex:1}}>
+      <div onClick={onClick} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"11px 13px",gap:10,flex:1,cursor:onClick?"pointer":"default"}}>
         <div style={{display:"flex",alignItems:"center",gap:9,flex:1,minWidth:0}}>
           <div style={{width:32,height:32,background:meta.bg,borderRadius:7,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
             <Icon name={meta.icon} size={15} color={meta.color}/>
@@ -902,6 +979,10 @@ function TaskCard({demand,now,onClick}) {
         </div>
         <span style={{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:5,background:statusMeta.bg,color:statusMeta.color,whiteSpace:"nowrap",flexShrink:0}}>{statusMeta.label}</span>
       </div>
+      {approvable&&<button onClick={(e)=>{e.stopPropagation();onApprove();}}
+        style={{background:VI.green,border:"none",color:"#fff",fontSize:12,fontWeight:600,padding:"0 16px",cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,flexShrink:0}}>
+        <Icon name="check" size={13} color="#fff"/>Aprovar
+      </button>}
     </div>
   );
 }
@@ -1203,6 +1284,198 @@ function AdminDashboard({onLogout}) {
     </Modal>}
   </AppShell>);
 }
+function SupervisaoDashboard({onLogout}) {
+  const [stores,setStores]=useState([]);
+  const [demandsMap,setDemandsMap]=useState({});
+  const [now,setNow]=useState(new Date());
+  const [detailStore,setDetailStore]=useState(null);
+  const [showNew,setShowNew]=useState(false);
+  const [newStoreId,setNewStoreId]=useState("");
+  const [quickIdx,setQuickIdx]=useState(null);
+  const [title,setTitle]=useState("");
+  const [description,setDescription]=useState("");
+  const [dueDate,setDueDate]=useState("");
+  const [dueTime,setDueTime]=useState("");
+  const [assignTo,setAssignTo]=useState("");
+  const [saving,setSaving]=useState(false);
+
+  useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
+  useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>s.active!==false).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
+  useEffect(()=>{
+    if(stores.length===0)return;
+    const us=stores.map(s=>onSnapshot(demandsRef(s.id),snap=>{
+      setDemandsMap(prev=>({...prev,[s.id]:snap.exists()?(snap.data().items||[]):[]}));
+    }));
+    return()=>us.forEach(u=>u());
+  },[stores]);
+
+  // Mantém a loja aberta em detalhe sincronizada caso ela mude na lista.
+  useEffect(()=>{
+    setDetailStore(prev=>{
+      if(!prev)return prev;
+      return stores.find(s=>s.id===prev.id)||prev;
+    });
+  },[stores]);
+
+  const countsFor=(sid)=>{
+    const items=demandsMap[sid]||[];
+    return{
+      pendentes:items.filter(d=>d.status==="PENDENTE").length,
+      atrasadas:items.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA").length,
+      concluidas:items.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA").length,
+    };
+  };
+  const totals=stores.reduce((a,s)=>{const c=countsFor(s.id);a.pendentes+=c.pendentes;a.atrasadas+=c.atrasadas;a.concluidas+=c.concluidas;return a;},{pendentes:0,atrasadas:0,concluidas:0});
+
+  const openNew=(storeId)=>{
+    setNewStoreId(storeId||"");setQuickIdx(null);setTitle("");setDescription("");setAssignTo("");
+    const d=new Date(Date.now()+2*3600000);
+    setDueDate(d.toISOString().slice(0,10));
+    setDueTime(`${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`);
+    setShowNew(true);
+  };
+  const pickQuick=(i)=>{setQuickIdx(i);setTitle(QUICK_TASKS[i].title);setDescription(QUICK_TASKS[i].description);};
+
+  const createDemand=async()=>{
+    if(!newStoreId||!title.trim()||!dueDate||!dueTime)return;
+    setSaving(true);
+    const dueAt=new Date(`${dueDate}T${dueTime}:00`).toISOString();
+    const current=demandsMap[newStoreId]||[];
+    // Demandas avulsas fecham direto quando a loja marca como realizada —
+    // a aprovação da Supervisão é só para Envio de Parcial e Fechamento.
+    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),requiresReview:false,assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:new Date().toISOString(),dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
+    await setDoc(demandsRef(newStoreId),{items:[...current,item],updatedAt:serverTimestamp()});
+    setSaving(false);setShowNew(false);
+  };
+
+  const approveDemand=async(storeId,demandId)=>{
+    const items=demandsMap[storeId]||[];
+    const updated=items.map(d=>d.id===demandId?{...d,status:d.pendingStatus||"CONCLUIDA_NO_PRAZO",pointsAwarded:d.pendingPoints||0}:d);
+    await setDoc(demandsRef(storeId),{items:updated,updatedAt:serverTimestamp()});
+  };
+
+  if(detailStore){
+    const items=demandsMap[detailStore.id]||[];
+    const groups={
+      atrasadas:items.filter(d=>d.status==="ATRASADA"||d.status==="ESCALADA"),
+      pendentes:items.filter(d=>d.status==="PENDENTE").sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt)),
+      aguardando:items.filter(d=>d.status==="AGUARDANDO_APROVACAO"),
+      concluidas:items.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA"),
+    };
+    return(<AppShell>
+      <Topbar title={detailStore.name} sub="Demandas da loja"
+        actions={<>
+          <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setDetailStore(null)}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn>
+          <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>openNew(detailStore.id)}><Icon name="plus" size={13} color="#fff"/>Nova demanda</Btn>
+        </>}/>
+      <div style={{padding:"14px 22px 60px"}}>
+        {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now}/>}
+        <TaskSection title="Pendentes" items={groups.pendentes} now={now} empty="Nenhuma tarefa pendente"/>
+        {groups.aguardando.length>0&&<TaskSection title="Aguardando aprovação" items={groups.aguardando} now={now} onApprove={d=>approveDemand(detailStore.id,d.id)}/>}
+        {groups.concluidas.length>0&&<TaskSection title="Concluídas hoje" items={groups.concluidas} now={now} dim/>}
+      </div>
+      {showNew&&<NewDemandModal stores={stores} storeId={newStoreId} setStoreId={setNewStoreId}
+        quickIdx={quickIdx} onPickQuick={pickQuick}
+        title={title} setTitle={setTitle} description={description} setDescription={setDescription}
+        dueDate={dueDate} setDueDate={setDueDate} dueTime={dueTime} setDueTime={setDueTime}
+        assignTo={assignTo} setAssignTo={setAssignTo}
+        saving={saving} onCancel={()=>setShowNew(false)} onCreate={createDemand}/>}
+    </AppShell>);
+  }
+
+  return(<AppShell>
+    <Topbar title="Supervisão" sub={<span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>}
+      actions={<>
+        <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>openNew("")}><Icon name="plus" size={13} color="#fff"/>Nova demanda</Btn>
+        <Btn variant="ghost" style={{padding:"9px 10px",display:"flex",alignItems:"center"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
+      </>}/>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,margin:"18px 22px 0"}}>
+      {[{num:totals.pendentes,label:"Pendentes"},{num:totals.atrasadas,label:"Atrasadas",color:totals.atrasadas?VI.red:VI.carvao},{num:totals.concluidas,label:"Concluídas hoje",color:VI.green}].map((s,i)=>(
+        <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 10px",textAlign:"center"}}>
+          <div style={{fontSize:24,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
+          <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+        </div>
+      ))}
+    </div>
+    <div style={{padding:"18px 22px"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Lojas</div>
+      {stores.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="store" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma loja cadastrada.</p></div>}
+      {stores.map(s=>{
+        const c=countsFor(s.id);
+        return(<div key={s.id} onClick={()=>setDetailStore(s)}
+          style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:7,cursor:"pointer",transition:"border-color .2s"}}
+          onMouseEnter={e=>e.currentTarget.style.borderColor=VI.terra}
+          onMouseLeave={e=>e.currentTarget.style.borderColor=VI.border}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              {c.atrasadas>0&&<span style={{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:5,background:VI.redBg,color:VI.red}}>{c.atrasadas} atrasada{c.atrasadas>1?"s":""}</span>}
+              <span style={{fontSize:12,color:VI.muted}}>{c.pendentes} pendente{c.pendentes!==1?"s":""}</span>
+              <Icon name="chevR" size={15} color={VI.border}/>
+            </div>
+          </div>
+        </div>);
+      })}
+    </div>
+    {showNew&&<NewDemandModal stores={stores} storeId={newStoreId} setStoreId={setNewStoreId}
+      quickIdx={quickIdx} onPickQuick={pickQuick}
+      title={title} setTitle={setTitle} description={description} setDescription={setDescription}
+      dueDate={dueDate} setDueDate={setDueDate} dueTime={dueTime} setDueTime={setDueTime}
+      assignTo={assignTo} setAssignTo={setAssignTo}
+      saving={saving} onCancel={()=>setShowNew(false)} onCreate={createDemand}/>}
+  </AppShell>);
+}
+
+function NewDemandModal({stores,storeId,setStoreId,quickIdx,onPickQuick,title,setTitle,description,setDescription,dueDate,setDueDate,dueTime,setDueTime,assignTo,setAssignTo,saving,onCancel,onCreate}) {
+  const selectedStore=stores.find(s=>s.id===storeId);
+  const roster=selectedStore?.roster||[];
+  return(<Modal onClose={onCancel}>
+    <MIcon name="bell"/>
+    <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Nova demanda</h2>
+    <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>Envie uma tarefa avulsa para a loja — montagem de vitrine, organização de seção, reposição direcionada etc. As 4 tarefas principais (limpeza, caixa, parcial e fechamento) já são automáticas.</p>
+
+    <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Loja</div>
+    <select value={storeId} onChange={e=>{setStoreId(e.target.value);setAssignTo("");}}
+      style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:14,cursor:"pointer",color:storeId?VI.carvao:VI.muted}}>
+      <option value="">Selecione a loja</option>
+      {stores.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+    </select>
+
+    <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Designar a (opcional)</div>
+    <select value={assignTo} onChange={e=>setAssignTo(e.target.value)} disabled={!storeId}
+      style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:14,cursor:storeId?"pointer":"not-allowed",color:assignTo?VI.carvao:VI.muted}}>
+      <option value="">Aberta à equipe da loja</option>
+      {roster.map(m=><option key={m.id} value={m.name}>{m.name}</option>)}
+    </select>
+    {storeId&&roster.length===0&&<p style={{color:VI.muted,fontSize:12,marginTop:-8,marginBottom:14}}>Esta loja ainda não tem equipe cadastrada.</p>}
+
+    <div style={{fontSize:11,color:VI.muted,marginBottom:7,textTransform:"uppercase",letterSpacing:"0.05em"}}>Tipo rápido</div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14}}>
+      {QUICK_TASKS.map((q,i)=>(
+        <button key={q.title} onClick={()=>onPickQuick(i)}
+          style={{background:quickIdx===i?`${VI.terra}18`:"transparent",border:`1px solid ${quickIdx===i?VI.terra:VI.border}`,borderRadius:20,padding:"6px 12px",color:quickIdx===i?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+          {q.title}
+        </button>
+      ))}
+    </div>
+
+    <Inp placeholder="Título da tarefa" value={title} onChange={e=>setTitle(e.target.value)}/>
+    <Inp placeholder="Descrição (opcional)" value={description} onChange={e=>setDescription(e.target.value)}/>
+
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:6}}>
+      <div><div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Prazo — data</div>
+        <input type="date" value={dueDate} onChange={e=>setDueDate(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/></div>
+      <div><div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Prazo — hora</div>
+        <input type="time" value={dueTime} onChange={e=>setDueTime(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"10px 12px",color:VI.carvao,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}/></div>
+    </div>
+
+    <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:16}}>
+      <Btn variant="ghost" onClick={onCancel}>Cancelar</Btn>
+      <Btn variant="accent" disabled={!storeId||!title.trim()||!dueDate||!dueTime||saving} onClick={onCreate}>{saving?"Enviando…":"Enviar demanda"}</Btn>
+    </div>
+  </Modal>);
+}
+
 function exportPDF(storeName,queue,services,startedAt){
   const nS=services.filter(s=>!s.isSale);
   const tV=services.length,tSa=services.filter(s=>s.isSale).length;
@@ -1337,3 +1610,4 @@ ${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
   const w=window.open("","_blank");
   if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
 }
+
