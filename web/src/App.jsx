@@ -71,10 +71,23 @@ const TASK_STATUS = {
   ATRASADA:              { label:"Atrasada",                      color:VI.red, bg:VI.redBg },
   ESCALADA:              { label:"Escalada · supervisão avisada", color:VI.red, bg:VI.redBg },
 };
-// Regras de pontuação — espelham a spec v3, §7 (gamificação por tarefa)
-const TASK_SCORE = { ON_TIME:10, QUALITY_BONUS:5, LATE:2, PERFECT:15 };
-// Prazo (min a partir da abertura) das tarefas de abertura — spec v3, §4
-const ABERTURA_SLA_MIN = { LIMPEZA:30, CAIXA:30 };
+// Regras de pontuação — espelham a spec v3, §7 (gamificação por tarefa).
+// Cada tarefa fixa tem seu próprio valor-base (TASK_POINTS); atraso paga
+// uma fração desse valor (LATE_RATIO), e observação preenchida soma um bônus fixo.
+const TASK_SCORE = { QUALITY_BONUS:5, LATE_RATIO:0.2, PERFECT:15 };
+const TASK_POINTS = {
+  CAIXA_ABERTURA:10,
+  DIARIA:10,
+  LIMPEZA_ABERTURA:20,
+  PARCIAL:20,
+  LIMPEZA_FECHAMENTO:20,
+  CAIXA_FECHAMENTO:20,
+  AVULSA:10,
+};
+// Prazo (min a partir da abertura) das tarefas de abertura
+const ABERTURA_SLA_MIN = { CAIXA:30, DIARIA:30, LIMPEZA:60 };
+// Antecedência (min antes do fechamento) das tarefas de fechamento
+const FECHAMENTO_LEAD_MIN = { LIMPEZA:60, CAIXA:30 };
 // Escala de horário de fechamento por loja — ajuste aqui conforme a escala real.
 const STORE_CLOSING_HOUR = {
   "centro": 19,
@@ -86,7 +99,7 @@ const STORE_CLOSING_HOUR = {
 const getClosingHour = (storeName="") => STORE_CLOSING_HOUR[storeName.trim().toLowerCase()] ?? 21; // padrão se a loja não estiver na escala
 
 // Menu rápido de demandas avulsas — o dia a dia que a Supervisão manda,
-// além das 4 tarefas principais automáticas. Pode ser designado a uma
+// além das 6 tarefas principais automáticas. Pode ser designado a uma
 // vendedora específica ou deixado aberto à loja.
 const QUICK_TASKS = [
   { title:"Arrumar sua seção",        description:"Organizar a seção de responsabilidade da vendedora." },
@@ -114,13 +127,15 @@ function seedDemandsFromOpening(openingIso,storeName){
   const closingHour=getClosingHour(storeName);
   const dayRef=new Date(openingIso);
   const at=(h,m=0)=>{const d=new Date(dayRef);d.setHours(h,m,0,0);return d.toISOString();};
+  const beforeClose=(mins)=>new Date(new Date(at(closingHour,0)).getTime()-mins*min).toISOString();
   const blank={assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE",createdAt:openingIso,completedAt:null};
   return [
-    { id:uid(), code:"LIMPEZA",           type:"ABERTURA",   title:"Limpeza da loja",              description:"Piso, vitrine e provadores limpos antes da abertura.", dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
-    { id:uid(), code:"CAIXA_ABERTURA",    type:"ABERTURA",   title:"Caixa conferido — Abertura",   description:"Fundo de caixa contado e registrado na abertura.",     dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
-    { id:uid(), code:"PARCIAL",           type:"FECHAMENTO", title:"Envio de Parcial",             description:"Enviar o parcial do dia para a Supervisão.",           dueAt:at(16,0), ...blank },
-    { id:uid(), code:"CAIXA_FECHAMENTO",  type:"FECHAMENTO", title:"Caixa conferido — Fechamento", description:"Fundo de caixa contado e registrado no fechamento.",   dueAt:at(closingHour,0), ...blank },
-    { id:uid(), code:"FECHAMENTO",        type:"FECHAMENTO", title:"Envio de Fechamento",          description:`Enviar o fechamento do dia (escala desta loja: ${closingHour}h).`, dueAt:at(closingHour,0), ...blank },
+    { id:uid(), code:"CAIXA_ABERTURA",     type:"ABERTURA",   title:"Conferência do Caixa",  description:"Fundo de caixa contado e registrado na abertura.",                points:TASK_POINTS.CAIXA_ABERTURA,     dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
+    { id:uid(), code:"DIARIA",             type:"ABERTURA",   title:"Diária",                description:"Conferir/preencher a planilha de diária.",                        points:TASK_POINTS.DIARIA,             dueAt:new Date(opening+ABERTURA_SLA_MIN.DIARIA*min).toISOString(),  ...blank },
+    { id:uid(), code:"LIMPEZA_ABERTURA",   type:"ABERTURA",   title:"Limpeza de Loja",       description:"Piso, vitrine e provadores limpos antes da abertura.",            points:TASK_POINTS.LIMPEZA_ABERTURA,   dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
+    { id:uid(), code:"PARCIAL",            type:"FECHAMENTO", title:"Envio da Parcial",      description:"Enviar o parcial do dia para a Supervisão até 16h (tolerância até 16h30).", points:TASK_POINTS.PARCIAL, dueAt:at(16,30), ...blank },
+    { id:uid(), code:"LIMPEZA_FECHAMENTO", type:"FECHAMENTO", title:"Limpeza de Loja",       description:"Limpeza geral da loja antes do fechamento.",                      points:TASK_POINTS.LIMPEZA_FECHAMENTO, dueAt:beforeClose(FECHAMENTO_LEAD_MIN.LIMPEZA), ...blank },
+    { id:uid(), code:"CAIXA_FECHAMENTO",   type:"FECHAMENTO", title:"Fechamento de Caixa",   description:"Fundo de caixa contado e registrado no fechamento.",              points:TASK_POINTS.CAIXA_FECHAMENTO,   dueAt:beforeClose(FECHAMENTO_LEAD_MIN.CAIXA),   ...blank },
   ];
 }
 
@@ -536,7 +551,8 @@ function StoreApp({store,onLogout}) {
     const onTime=completedAt<=new Date(activeTask.dueAt);
     const qualityBonus=taskNote.trim()?TASK_SCORE.QUALITY_BONUS:0;
     const status=onTime?"CONCLUIDA_NO_PRAZO":"CONCLUIDA_ATRASADA";
-    const points=(onTime?TASK_SCORE.ON_TIME:TASK_SCORE.LATE)+qualityBonus;
+    const base=activeTask.points||TASK_POINTS.AVULSA;
+    const points=(onTime?base:Math.round(base*TASK_SCORE.LATE_RATIO))+qualityBonus;
 
     let updated=demands.map(d=>d.id===activeTask.id?{...d,status,note:taskNote,pointsAwarded:points,completedBy:taskWho,completedAt:completedAt.toISOString()}:d);
 
@@ -1604,7 +1620,7 @@ function SupervisaoDashboard({onLogout}) {
     const current=demandsMap[newStoreId]||[];
     // Demandas avulsas fecham direto quando a loja marca como realizada.
     const now=new Date().toISOString();
-    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:now,createdAt:now,completedAt:null,dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
+    const item={id:uid(),type:"AVULSA",title:title.trim(),description:description.trim(),points:TASK_POINTS.AVULSA,assignedTo:assignTo||null,sentBy:"Supervisão",requestedAt:now,createdAt:now,completedAt:null,dueAt,status:"PENDENTE",note:"",pointsAwarded:0,completedBy:null};
     await setDoc(demandsRef(newStoreId),{items:[...current,item],updatedAt:serverTimestamp()});
     setSaving(false);setShowNew(false);
   };
@@ -1707,7 +1723,7 @@ function NewDemandModal({stores,storeId,setStoreId,quickIdx,onPickQuick,title,se
   return(<Modal onClose={onCancel}>
     <MIcon name="bell"/>
     <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Nova demanda</h2>
-    <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>Envie uma tarefa avulsa para a loja — montagem de vitrine, organização de seção, reposição direcionada etc. As 4 tarefas principais (limpeza, caixa, parcial e fechamento) já são automáticas.</p>
+    <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>Envie uma tarefa avulsa para a loja — montagem de vitrine, organização de seção, reposição direcionada etc. As 6 tarefas principais (caixa, diária, limpeza e parcial) já são automáticas.</p>
 
     <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Loja</div>
     <select value={storeId} onChange={e=>{setStoreId(e.target.value);setAssignTo("");}}
