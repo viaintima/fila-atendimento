@@ -929,11 +929,6 @@ function StoreApp({store,onLogout}) {
     const ns=services.map(s=>s.id===id?{...s,outcome:oId,outcomeLabel:label,isSale,detail}:s);
     setServices(ns);setEditSvc(null);setEditStep("main");setEditSubD("");await persist(null,ns);
   };
-  const editSvcFn=async(id,oId,detail="")=>{
-    const{label,isSale}=resolve(oId,detail);
-    const ns=services.map(s=>s.id===id?{...s,outcome:oId,outcomeLabel:label,isSale,detail}:s);
-    setServices(ns);setEditSvc(null);setEditStep("main");setEditSubD("");await persist(null,ns);
-  };
   const cancelSvc=async()=>{
     if(!curSvc)return;
     const nq=queue.map(p=>p.id===curSvc.salespersonId?{...p,status:"waiting"}:p);
@@ -1715,9 +1710,13 @@ function AdminDashboard({onLogout}) {
   const [now,setNow]=useState(new Date());
   const [teamStore,setTeamStore]=useState(null);
   const [newMemberName,setNewMemberName]=useState("");
+  const [reservations,setReservations]=useState([]);
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
+  // Reservas — coleção única no topo (não por loja), então carregamos tudo aqui
+  // e filtramos por loja/período no cliente (mesmo padrão do dashboard geral).
+  useEffect(()=>{const u=onSnapshot(reservationsCol(),snap=>{setReservations(snap.docs.map(d=>d.data()));});return()=>u();},[]);
   useEffect(()=>{if(stores.length===0)return;const us=stores.map(s=>onSnapshot(sessionRef(s.id),snap=>{setSessions(prev=>({...prev,[s.id]:snap.exists()?snap.data():{queue:[],services:[]}}));}));return()=>us.forEach(u=>u());},[stores]);
   useEffect(()=>{if(stores.length===0)return;const us=stores.map(s=>onSnapshot(demandsRef(s.id),snap=>{setDemandsLive(prev=>({...prev,[s.id]:snap.exists()?(snap.data().items||[]):[]}));}));return()=>us.forEach(u=>u());},[stores]);
 
@@ -1854,9 +1853,45 @@ function AdminDashboard({onLogout}) {
       pointsMap[key].tasks++;pointsMap[key].points+=d.pointsAwarded||0;
     });
     const sortedPoints=Object.values(pointsMap).sort((a,b)=>b.points-a.points);
-    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate,sortedPoints});
+
+    // Reservas — mesmo filtro de período/lojas do dashboard, usando createdAt
+    // da reserva. "Encerradas elegíveis" = convertida, parcial, perdida ou
+    // cancelada — exceto cancelamento por erro/duplicidade, que não é uma
+    // oportunidade comercial perdida de verdade (só corrige um cadastro).
+    const resInRange=reservations.filter(r=>dStores.includes(r.storeId)&&r.createdAt&&new Date(r.createdAt)>=from&&new Date(r.createdAt)<=to);
+    const NON_LOSS_CANCEL=["Cadastro duplicado","Erro de cadastro"];
+    const resEligible=resInRange.filter(r=>["CONVERTIDA","PARCIAL","PERDIDA","CANCELADA"].includes(r.status)&&!(r.status==="CANCELADA"&&NON_LOSS_CANCEL.includes(r.cancellationReason)));
+    const resConvertedAny=resEligible.filter(r=>r.status==="CONVERTIDA"||r.status==="PARCIAL");
+    const resConvertedFull=resEligible.filter(r=>r.status==="CONVERTIDA");
+    const resTaxaConversao=resEligible.length>0?Math.round((resConvertedAny.length/resEligible.length)*100):0;
+    const resConversaoIntegral=resEligible.length>0?Math.round((resConvertedFull.length/resEligible.length)*100):0;
+    const resValorReservado=resEligible.reduce((a,r)=>a+(r.estimatedTotal||0),0);
+    const resValorVendido=resEligible.reduce((a,r)=>a+(r.convertedTotal||0),0);
+    const resConversaoValor=resValorReservado>0?Math.round((resValorVendido/resValorReservado)*100):0;
+    const resLiveNow=resInRange.map(r=>({...r,liveStatus:liveReservationStatus(r,new Date())}));
+    const resLossReasonMap={},resCancelReasonMap={};
+    resInRange.forEach(r=>{
+      if(r.status==="PERDIDA"&&r.cancellationReason)resLossReasonMap[r.cancellationReason]=(resLossReasonMap[r.cancellationReason]||0)+1;
+      if(r.status==="CANCELADA"&&r.cancellationReason)resCancelReasonMap[r.cancellationReason]=(resCancelReasonMap[r.cancellationReason]||0)+1;
+    });
+    const resData={
+      total:resInRange.length,
+      ativas:resLiveNow.filter(r=>RESERVATION_OPEN_STATUSES.includes(r.liveStatus)).length,
+      vencidas:resLiveNow.filter(r=>r.liveStatus==="VENCIDA").length,
+      convertidas:resConvertedAny.length,
+      eligibleCount:resEligible.length,
+      taxaConversao:resTaxaConversao,
+      conversaoIntegral:resConversaoIntegral,
+      conversaoValor:resConversaoValor,
+      valorReservado:resValorReservado,
+      valorVendido:resValorVendido,
+      sortedLossReasons:Object.entries(resLossReasonMap).sort((a,b)=>b[1]-a[1]),
+      sortedCancelReasons:Object.entries(resCancelReasonMap).sort((a,b)=>b[1]-a[1]),
+    };
+
+    setDData({tSvc,tSales,conv,avgDur,sortedR,sortedStaff,sortedStores,sortedH,maxH,peakH,avgResolution,onTimePct,tTasksDone,tTasksLate,sortedPoints,resData});
     setDBusy(false);
-  },[dFrom,dTo,dStores,allHist,sessions,demandsLive,stores]);
+  },[dFrom,dTo,dStores,allHist,sessions,demandsLive,stores,reservations]);
 
   const mx=sid=>{const d=sessions[sid]||{queue:[],services:[]};const sv=d.services||[],q=d.queue||[];const sa=sv.filter(s=>s.isSale).length;return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length,queue:q,services:sv,startedAt:d.startedAt};};
   const actSt=stores.filter(s=>s.active!==false);
@@ -2000,6 +2035,58 @@ function AdminDashboard({onLogout}) {
           </div>
           {dData.tTasksLate>0&&<div style={{marginTop:12,fontSize:12,color:VI.red,display:"flex",alignItems:"center",gap:5}}><Icon name="clock" size={13} color={VI.red}/>{dData.tTasksLate} tarefa{dData.tTasksLate>1?"s":""} atrasada{dData.tTasksLate>1?"s":""} ou escalada{dData.tTasksLate>1?"s":""} no período (ainda em aberto).</div>}
         </div>
+
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+            <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600}}>Reservas</div>
+            <div style={{fontSize:11,color:VI.muted}}>{dData.resData.total} criada{dData.resData.total!==1?"s":""} no período</div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+            {[
+              {n:`${dData.resData.taxaConversao}%`,l:"Taxa de conversão",c:dData.resData.taxaConversao>=50?VI.green:dData.resData.taxaConversao>=25?VI.yellow:VI.red},
+              {n:`${dData.resData.conversaoIntegral}%`,l:"Conversão integral",c:VI.carvao},
+              {n:`${dData.resData.conversaoValor}%`,l:"Conversão por valor",c:VI.carvao},
+            ].map((k,i)=>(
+              <div key={i} style={{textAlign:"center"}}>
+                <div style={{fontSize:20,fontWeight:700,color:k.c,letterSpacing:"-0.02em",lineHeight:1}}>{k.n}</div>
+                <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{k.l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,paddingTop:12,borderTop:`1px solid ${VI.border}`,marginBottom:dData.resData.eligibleCount>0?12:0}}>
+            {[
+              {n:dData.resData.ativas,l:"Ativas agora"},
+              {n:dData.resData.vencidas,l:"Vencidas agora",c:dData.resData.vencidas>0?VI.red:VI.carvao},
+              {n:dData.resData.convertidas,l:"Vendas recuperadas",c:VI.green},
+              {n:`R$ ${dData.resData.valorVendido.toFixed(0)}`,l:"Valor vendido",c:VI.green},
+            ].map((k,i)=>(
+              <div key={i} style={{textAlign:"center"}}>
+                <div style={{fontSize:16,fontWeight:700,color:k.c||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{k.n}</div>
+                <div style={{fontSize:9,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{k.l}</div>
+              </div>
+            ))}
+          </div>
+          {dData.resData.eligibleCount===0&&<div style={{fontSize:12,color:VI.muted}}>Nenhuma reserva encerrada (convertida, perdida ou cancelada) no período para calcular conversão.</div>}
+          {dData.resData.sortedLossReasons.length>0&&<div style={{marginTop:4}}>
+            <div style={{fontSize:11,fontWeight:600,color:VI.muted,marginBottom:8}}>Motivos — cliente retornou sem comprar</div>
+            {(()=>{const maxL=dData.resData.sortedLossReasons[0]?.[1]||1;return dData.resData.sortedLossReasons.map(([label,cnt])=>(
+              <div key={label} style={{marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:3}}><span style={{color:VI.carvao}}>{label}</span><span style={{color:VI.muted}}>{cnt}</span></div>
+                <div style={{height:4,background:VI.surfaceAlt,borderRadius:99,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.round((cnt/maxL)*100)}%`,background:VI.red,borderRadius:99}}/></div>
+              </div>
+            ));})()}
+          </div>}
+          {dData.resData.sortedCancelReasons.length>0&&<div style={{marginTop:10}}>
+            <div style={{fontSize:11,fontWeight:600,color:VI.muted,marginBottom:8}}>Motivos — cancelamentos</div>
+            {(()=>{const maxC=dData.resData.sortedCancelReasons[0]?.[1]||1;return dData.resData.sortedCancelReasons.map(([label,cnt])=>(
+              <div key={label} style={{marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:3}}><span style={{color:VI.carvao}}>{label}</span><span style={{color:VI.muted}}>{cnt}</span></div>
+                <div style={{height:4,background:VI.surfaceAlt,borderRadius:99,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.round((cnt/maxC)*100)}%`,background:VI.muted,borderRadius:99}}/></div>
+              </div>
+            ));})()}
+          </div>}
+        </div>
+
         {dData.sortedPoints.length>0&&<div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:10}}>
           <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:12}}>Pontuação da equipe (tarefas)</div>
           {dData.sortedPoints.map((p,i)=>(
@@ -2228,9 +2315,11 @@ function SupervisaoDashboard({onLogout}) {
   const [dueTime,setDueTime]=useState("");
   const [assignTo,setAssignTo]=useState("");
   const [saving,setSaving]=useState(false);
+  const [reservations,setReservations]=useState([]);
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>s.active!==false).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
+  useEffect(()=>{const u=onSnapshot(reservationsCol(),snap=>{setReservations(snap.docs.map(d=>d.data()));});return()=>u();},[]);
   useEffect(()=>{
     if(stores.length===0)return;
     const us=stores.map(s=>onSnapshot(demandsRef(s.id),snap=>{
@@ -2273,6 +2362,19 @@ function SupervisaoDashboard({onLogout}) {
   };
   const queueTotals=stores.reduce((a,s)=>{const m=mxQ(s.id);a.svc+=m.svc;a.sales+=m.sales;return a;},{svc:0,sales:0});
   const queueConv=queueTotals.svc>0?Math.round((queueTotals.sales/queueTotals.svc)*100):0;
+
+  // Reservas — resumo ao vivo (painel da Supervisão é "hoje", sem filtro de
+  // período). Só considera lojas ativas visíveis neste painel.
+  const storeIds=stores.map(s=>s.id);
+  const resLive=reservations.filter(r=>storeIds.includes(r.storeId)).map(r=>({...r,liveStatus:liveReservationStatus(r,now)}));
+  const resTodayConverted=resLive.filter(r=>(r.status==="CONVERTIDA"||r.status==="PARCIAL")&&r.updatedAt&&new Date(r.updatedAt).toDateString()===now.toDateString());
+  const resSummary={
+    ativas:resLive.filter(r=>RESERVATION_OPEN_STATUSES.includes(r.liveStatus)).length,
+    venceHoje:resLive.filter(r=>r.liveStatus==="VENCE_HOJE").length,
+    vencidas:resLive.filter(r=>r.liveStatus==="VENCIDA").length,
+    convertidasHoje:resTodayConverted.length,
+    valorHoje:resTodayConverted.reduce((a,r)=>a+(r.convertedTotal||0),0),
+  };
 
   const openNew=(storeId)=>{
     setNewStoreId(storeId||"");setQuickIdx(null);setTitle("");setDescription("");setAssignTo("");
@@ -2346,6 +2448,24 @@ function SupervisaoDashboard({onLogout}) {
           <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 10px",textAlign:"center"}}>
             <div style={{fontSize:24,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
             <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+
+    <div style={{padding:"18px 22px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Reservas — agora</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
+        {[
+          {num:resSummary.ativas,label:"Ativas"},
+          {num:resSummary.venceHoje,label:"Vence hoje",color:resSummary.venceHoje>0?VI.yellow:VI.carvao},
+          {num:resSummary.vencidas,label:"Vencidas",color:resSummary.vencidas>0?VI.red:VI.carvao},
+          {num:resSummary.convertidasHoje,label:"Vendidas hoje",color:VI.green},
+          {num:`R$ ${resSummary.valorHoje.toFixed(0)}`,label:"Valor hoje",color:VI.green},
+        ].map((s,i)=>(
+          <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"12px 6px",textAlign:"center"}}>
+            <div style={{fontSize:18,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
+            <div style={{fontSize:9,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
           </div>
         ))}
       </div>
