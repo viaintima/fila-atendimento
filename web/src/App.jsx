@@ -1344,7 +1344,7 @@ function SupervisaoDashboard({onLogout}) {
     const d=sessions[sid]||{queue:[],services:[]};
     const sv=d.services||[],q=d.queue||[];
     const sa=sv.filter(s=>s.isSale).length;
-    return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length};
+    return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length,startedAt:d.startedAt};
   };
   const queueTotals=stores.reduce((a,s)=>{const m=mxQ(s.id);a.svc+=m.svc;a.sales+=m.sales;return a;},{svc:0,sales:0});
   const queueConv=queueTotals.svc>0?Math.round((queueTotals.sales/queueTotals.svc)*100):0;
@@ -1414,11 +1414,14 @@ function SupervisaoDashboard({onLogout}) {
       ))}
     </div>
 
-    <div style={{margin:"14px 22px 0",background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 16px"}}>
-      <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,marginBottom:10}}>Fila de vez — hoje (todas as lojas)</div>
-      <div style={{display:"flex",gap:22}}>
-        {[{v:queueTotals.svc,l:"Atendimentos"},{v:queueTotals.sales,l:"Vendas",c:VI.green},{v:`${queueConv}%`,l:"Conversão",c:queueConv>=60?VI.green:queueConv>=40?VI.yellow:VI.red}].map(({v,l,c})=>(
-          <div key={l}><div style={{fontSize:20,fontWeight:700,color:c||VI.carvao,letterSpacing:"-0.02em"}}>{v}</div><div style={{fontSize:10,color:VI.muted,textTransform:"uppercase"}}>{l}</div></div>
+    <div style={{padding:"18px 22px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Fila de vez — hoje</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
+        {[{num:queueTotals.svc,label:"Atendimentos"},{num:queueTotals.sales,label:"Vendas",color:VI.green},{num:`${queueConv}%`,label:"Conversão",color:queueConv>=60?VI.green:queueConv>=40?VI.yellow:VI.red}].map((s,i)=>(
+          <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 10px",textAlign:"center"}}>
+            <div style={{fontSize:24,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
+            <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+          </div>
         ))}
       </div>
     </div>
@@ -1435,9 +1438,13 @@ function SupervisaoDashboard({onLogout}) {
           onMouseEnter={e=>e.currentTarget.style.borderColor=VI.terra}
           onMouseLeave={e=>e.currentTarget.style.borderColor=VI.border}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div>
+            <div>
+              <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div>
+              {q.active>0?<div style={{fontSize:11,color:VI.muted,marginTop:2,display:"flex",alignItems:"center",gap:4}}><span style={{width:5,height:5,borderRadius:"50%",background:VI.green,display:"inline-block"}}/>{q.active} em turno · desde {fmtTime(q.startedAt)}</div>
+                :<div style={{fontSize:11,color:VI.muted,marginTop:2}}>Sem atividade</div>}
+            </div>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
-              {q.svc>0&&<div style={{display:"flex",gap:12}}>{[{v:q.svc,l:"Atend."},{v:q.sales,l:"Vendas",c:VI.green},{v:`${q.conv}%`,l:"Conv.",c:qc}].map(({v,l,c})=><div key={l} style={{textAlign:"center"}}><div style={{fontSize:15,fontWeight:700,color:c||VI.carvao}}>{v}</div><div style={{fontSize:9,color:VI.muted,textTransform:"uppercase"}}>{l}</div></div>)}</div>}
+              {q.svc>0&&<div style={{display:"flex",gap:14}}>{[{v:q.svc,l:"Atend."},{v:q.sales,l:"Vendas",c:VI.green},{v:`${q.conv}%`,l:"Conv.",c:qc}].map(({v,l,c})=><div key={l} style={{textAlign:"center"}}><div style={{fontSize:18,fontWeight:700,color:c||VI.carvao,letterSpacing:"-0.02em"}}>{v}</div><div style={{fontSize:10,color:VI.muted,textTransform:"uppercase"}}>{l}</div></div>)}</div>}
               {c.atrasadas>0&&<span style={{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:5,background:VI.redBg,color:VI.red}}>{c.atrasadas} atrasada{c.atrasadas>1?"s":""}</span>}
               <span style={{fontSize:12,color:VI.muted}}>{c.pendentes} pendente{c.pendentes!==1?"s":""}</span>
               <Icon name="chevR" size={15} color={VI.border}/>
