@@ -2426,63 +2426,109 @@ function SupervisaoDashboard({onLogout}) {
     </AppShell>);
   }
 
+  const alertCount=totals.atrasadas+resSummary.vencidas;
+
   return(<AppShell>
     <Topbar title="Supervisão" sub={<span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>}
       actions={<>
         <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>openNew("")}><Icon name="plus" size={13} color="#fff"/>Nova demanda</Btn>
         <Btn variant="ghost" style={{padding:"9px 10px",display:"flex",alignItems:"center"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
       </>}/>
-    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,margin:"18px 22px 0"}}>
-      {[{num:totals.pendentes,label:"Pendentes"},{num:totals.atrasadas,label:"Atrasadas",color:totals.atrasadas?VI.red:VI.carvao},{num:totals.concluidas,label:"Concluídas hoje",color:VI.green}].map((s,i)=>(
-        <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 10px",textAlign:"center"}}>
-          <div style={{fontSize:24,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
-          <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+
+    {alertCount>0&&<div style={{margin:"14px 22px 0",background:VI.redBg,border:`1px solid ${VI.red}44`,borderRadius:10,padding:"11px 15px",display:"flex",alignItems:"center",gap:9}}>
+      <Icon name="bell" size={15} color={VI.red}/>
+      <span style={{fontSize:12,color:VI.carvao}}>
+        {totals.atrasadas>0&&`${totals.atrasadas} tarefa${totals.atrasadas>1?"s":""} atrasada${totals.atrasadas>1?"s":""}`}
+        {totals.atrasadas>0&&resSummary.vencidas>0&&" · "}
+        {resSummary.vencidas>0&&`${resSummary.vencidas} reserva${resSummary.vencidas>1?"s":""} vencida${resSummary.vencidas>1?"s":""}`}
+        {" "}precisam de atenção.
+      </span>
+    </div>}
+
+    <div style={{padding:"18px 22px 0"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Painel do dia</div>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,overflow:"hidden",display:"flex"}}>
+          <div style={{width:4,flexShrink:0,background:VI.terra}}/>
+          <div style={{flex:1,padding:"13px 15px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:11}}>
+              <Icon name="list" size={14} color={VI.terra}/>
+              <span style={{fontSize:13,fontWeight:600,color:VI.carvao}}>Tarefas das lojas</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+              {[{num:totals.pendentes,label:"Pendentes"},{num:totals.atrasadas,label:"Atrasadas",color:totals.atrasadas?VI.red:VI.carvao},{num:totals.concluidas,label:"Concluídas",color:VI.green}].map((s,i)=>(
+                <div key={i} style={{textAlign:"center"}}>
+                  <div style={{fontSize:20,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
+                  <div style={{fontSize:9,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
-      ))}
-    </div>
 
-    <div style={{padding:"18px 22px 0"}}>
-      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Fila de vez — hoje</div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
-        {[{num:queueTotals.svc,label:"Atendimentos"},{num:queueTotals.sales,label:"Vendas",color:VI.green},{num:`${queueConv}%`,label:"Conversão",color:queueConv>=60?VI.green:queueConv>=40?VI.yellow:VI.red}].map((s,i)=>(
-          <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 10px",textAlign:"center"}}>
-            <div style={{fontSize:24,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
-            <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,overflow:"hidden",display:"flex"}}>
+          <div style={{width:4,flexShrink:0,background:VI.gold}}/>
+          <div style={{flex:1,padding:"13px 15px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:11}}>
+              <Icon name="users" size={14} color={VI.gold}/>
+              <span style={{fontSize:13,fontWeight:600,color:VI.carvao}}>Fila de vez — hoje</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+              {[{num:queueTotals.svc,label:"Atendimentos"},{num:queueTotals.sales,label:"Vendas",color:VI.green},{num:`${queueConv}%`,label:"Conversão",color:queueConv>=60?VI.green:queueConv>=40?VI.yellow:VI.red}].map((s,i)=>(
+                <div key={i} style={{textAlign:"center"}}>
+                  <div style={{fontSize:20,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
+                  <div style={{fontSize:9,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+                </div>
+              ))}
+            </div>
           </div>
-        ))}
+        </div>
+
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,overflow:"hidden",display:"flex"}}>
+          <div style={{width:4,flexShrink:0,background:"#2563eb"}}/>
+          <div style={{flex:1,padding:"13px 15px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:11}}>
+              <Icon name="bookmark" size={14} color="#2563eb"/>
+              <span style={{fontSize:13,fontWeight:600,color:VI.carvao}}>Reservas — agora</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:6}}>
+              {[
+                {num:resSummary.ativas,label:"Ativas"},
+                {num:resSummary.venceHoje,label:"Vence hoje",color:resSummary.venceHoje>0?VI.yellow:VI.carvao},
+                {num:resSummary.vencidas,label:"Vencidas",color:resSummary.vencidas>0?VI.red:VI.carvao},
+                {num:resSummary.convertidasHoje,label:"Vendidas",color:VI.green},
+                {num:`R$ ${resSummary.valorHoje.toFixed(0)}`,label:"Valor hoje",color:VI.green},
+              ].map((s,i)=>(
+                <div key={i} style={{textAlign:"center"}}>
+                  <div style={{fontSize:16,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
+                  <div style={{fontSize:8,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
 
-    <div style={{padding:"18px 22px 0"}}>
-      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Reservas — agora</div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
-        {[
-          {num:resSummary.ativas,label:"Ativas"},
-          {num:resSummary.venceHoje,label:"Vence hoje",color:resSummary.venceHoje>0?VI.yellow:VI.carvao},
-          {num:resSummary.vencidas,label:"Vencidas",color:resSummary.vencidas>0?VI.red:VI.carvao},
-          {num:resSummary.convertidasHoje,label:"Vendidas hoje",color:VI.green},
-          {num:`R$ ${resSummary.valorHoje.toFixed(0)}`,label:"Valor hoje",color:VI.green},
-        ].map((s,i)=>(
-          <div key={i} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"12px 6px",textAlign:"center"}}>
-            <div style={{fontSize:18,fontWeight:700,color:s.color||VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{s.num}</div>
-            <div style={{fontSize:9,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{s.label}</div>
-          </div>
-        ))}
+    <div style={{padding:"22px 22px 40px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <span style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted}}>Lojas</span>
+        <span style={{fontSize:11,background:VI.surfaceAlt,color:VI.muted,padding:"2px 8px",borderRadius:99,border:`1px solid ${VI.border}`}}>{stores.length}</span>
       </div>
-    </div>
-
-    <div style={{padding:"18px 22px"}}>
-      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Lojas</div>
       {stores.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="store" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma loja cadastrada.</p></div>}
       {stores.map(s=>{
         const c=countsFor(s.id);
         const q=mxQ(s.id);
         const qc=q.conv>=60?VI.green:q.conv>=40?VI.yellow:VI.red;
+        const barColor=c.atrasadas>0?VI.red:q.active>0?VI.green:VI.border;
         return(<div key={s.id} onClick={()=>setDetailStore(s)}
-          style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:7,cursor:"pointer",transition:"border-color .2s"}}
+          style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,marginBottom:7,cursor:"pointer",transition:"border-color .2s",display:"flex",overflow:"hidden"}}
           onMouseEnter={e=>e.currentTarget.style.borderColor=VI.terra}
           onMouseLeave={e=>e.currentTarget.style.borderColor=VI.border}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{width:3,flexShrink:0,background:barColor}}/>
+          <div style={{flex:1,padding:"13px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
               <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div>
               {q.active>0?<div style={{fontSize:11,color:VI.muted,marginTop:2,display:"flex",alignItems:"center",gap:4}}><span style={{width:5,height:5,borderRadius:"50%",background:VI.green,display:"inline-block"}}/>{q.active} em turno · desde {fmtTime(q.startedAt)}</div>
