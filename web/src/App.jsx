@@ -1055,24 +1055,43 @@ function StoreApp({store,onLogout}) {
       onConverterIntegral={submitConverterIntegral} onVendaParcial={submitVendaParcial} storeName={store.name}/>);
   }
 
+  const STORE_NAV=[
+    {id:"queue",label:"Fila",icon:"users"},
+    {id:"report",label:"Relatório",icon:"chart"},
+    {id:"tasks",label:"Tarefas",icon:"list",badge:taskGroups.atrasadas.length},
+    {id:"reservations",label:"Reservas",icon:"bookmark",badge:resCounts.ativas,alert:resCounts.vencidas>0},
+  ];
+
   return(<AppShell>
     <Topbar title={store.name}
       sub={<><span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>{subSuffix(now)}</>}
       actions={<>
-        {view!=="queue"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("queue")}><Icon name="back" size={13} color={VI.muted}/>Fila</Btn>}
-        {view!=="report"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setView("report")}><Icon name="chart" size={13} color={VI.muted}/>Relatório</Btn>}
-        {view!=="tasks"&&<Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(taskGroups.atrasadas.length?{borderColor:VI.red,color:VI.red}:{})}} onClick={()=>setView("tasks")}><Icon name="list" size={13} color={taskGroups.atrasadas.length?VI.red:VI.muted}/>Tarefas{taskGroups.atrasadas.length>0?` (${taskGroups.atrasadas.length})`:""}</Btn>}
-        <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(resCounts.vencidas?{borderColor:VI.red,color:VI.red}:{})}} onClick={()=>setView("reservations")}><Icon name="bookmark" size={13} color={resCounts.vencidas?VI.red:VI.muted}/>Reservas{resCounts.ativas>0?` (${resCounts.ativas})`:""}</Btn>
         {view==="report"&&<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(store.name,queue,services,session?.startedAt,demands)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn><Btn variant="success" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setConfClose(true)}><Icon name="moon" size={13} color="#fff"/>Encerrar dia</Btn></>}
         {view==="queue"&&<Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>{setAddPersonId("");setShowAdd(true);}}><Icon name="plus" size={13} color="#fff"/>Entrada</Btn>}
         <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5,padding:"9px 10px"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
       </>}/>
+
+    <div style={{display:"flex",gap:6,padding:"10px 22px",borderBottom:`1px solid ${VI.border}`,background:VI.surface,overflowX:"auto"}}>
+      {STORE_NAV.map(t=>{
+        const active=view===t.id;
+        return(<button key={t.id} onClick={()=>setView(t.id)}
+          style={{display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:8,
+                  border:`1px solid ${t.alert?VI.red:active?VI.terra:VI.border}`,
+                  background:active?`${VI.terra}12`:"transparent",
+                  color:t.alert?VI.red:active?VI.terra:VI.muted,fontSize:12,fontWeight:active?600:500,
+                  cursor:"pointer",fontFamily:"inherit",flexShrink:0,whiteSpace:"nowrap"}}>
+          <Icon name={t.icon} size={13} color={t.alert?VI.red:active?VI.terra:VI.muted}/>
+          {t.label}
+          {t.badge>0&&<span style={{fontSize:10,fontWeight:700,background:t.alert?VI.red:VI.terra,color:"#fff",borderRadius:99,padding:"1px 6px",marginLeft:1}}>{t.badge}</span>}
+        </button>);
+      })}
+    </div>
+
     {view!=="tasks"&&<StatsRow items={[{num:tSvc,label:"Atendimentos"},{num:tSales,label:"Vendas",color:VI.green},{num:`${conv}%`,label:"Conversão"},{num:aqArr.filter(p=>p.status==="waiting").length,label:"Na fila"}]}/>}
     {view==="tasks"&&<StatsRow items={[{num:taskGroups.pendentes.length,label:"Pendentes"},{num:taskGroups.atrasadas.length,label:"Atrasadas",color:taskGroups.atrasadas.length?VI.red:VI.carvao},{num:taskGroups.concluidas.length,label:"Concluídas",color:VI.green},{num:pointsToday,label:"Pontos hoje"}]}/>}
 
-    <div style={{margin:"10px 22px 0",padding:"8px 12px",background:VI.surfaceAlt,borderRadius:8,fontSize:12,color:VI.muted,display:"flex",justifyContent:"space-between",alignItems:"center",border:`1px solid ${VI.border}`}}>
-      <span>Dia iniciado às {fmtTime(session?.startedAt)}</span>
-      {view==="queue"&&<button onClick={()=>setView("report")} style={{background:"none",border:"none",color:VI.terra,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>Relatório e encerramento</button>}
+    <div style={{margin:"10px 22px 0",padding:"8px 12px",background:VI.surfaceAlt,borderRadius:8,fontSize:12,color:VI.muted,border:`1px solid ${VI.border}`}}>
+      Dia iniciado às {fmtTime(session?.startedAt)}
     </div>
 
     {view==="queue"&&<>
