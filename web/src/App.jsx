@@ -1952,10 +1952,20 @@ function AdminDashboard({onLogout}) {
 
   return(<AppShell>
     <Topbar title="Painel Admin" sub={<span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>}
-      actions={<>
-        {TABS.map(t=><Btn key={t.id} variant="ghost" style={{display:"flex",alignItems:"center",gap:5,...(tab===t.id?{borderColor:VI.terra,color:VI.terra}:{})}} onClick={()=>setTab(t.id)}><Icon name={t.icon} size={13} color={tab===t.id?VI.terra:VI.muted}/>{t.label}</Btn>)}
-        <Btn variant="ghost" style={{padding:"9px 10px",display:"flex",alignItems:"center"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
-      </>}/>
+      actions={<Btn variant="ghost" style={{padding:"9px 10px",display:"flex",alignItems:"center"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>}/>
+
+    <div style={{display:"flex",gap:6,padding:"10px 22px",borderBottom:`1px solid ${VI.border}`,background:VI.surface,overflowX:"auto"}}>
+      {TABS.map(t=>{
+        const active=tab===t.id;
+        return(<button key={t.id} onClick={()=>setTab(t.id)}
+          style={{display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:8,flex:1,justifyContent:"center",
+                  border:`1px solid ${active?VI.terra:VI.border}`,background:active?`${VI.terra}12`:"transparent",
+                  color:active?VI.terra:VI.muted,fontSize:12,fontWeight:active?600:500,
+                  cursor:"pointer",fontFamily:"inherit",flexShrink:0,whiteSpace:"nowrap"}}>
+          <Icon name={t.icon} size={13} color={active?VI.terra:VI.muted}/>{t.label}
+        </button>);
+      })}
+    </div>
 
     {tab==="overview"&&<>
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,margin:"18px 22px 0"}}>
@@ -1966,15 +1976,19 @@ function AdminDashboard({onLogout}) {
           </div>
         ))}
       </div>
-      <div style={{padding:"18px 22px"}}>
-        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Lojas</div>
+      <div style={{padding:"22px 22px 0"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <span style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted}}>Lojas</span>
+          <span style={{fontSize:11,background:VI.surfaceAlt,color:VI.muted,padding:"2px 8px",borderRadius:99,border:`1px solid ${VI.border}`}}>{stores.length}</span>
+        </div>
         {stores.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="store" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma loja cadastrada.</p><Btn variant="accent" style={{display:"inline-flex",alignItems:"center",gap:5,marginTop:14}} onClick={()=>setTab("stores")}><Icon name="plus" size={13} color="#fff"/>Criar loja</Btn></div>}
-        {stores.map(s=>{const m=mx(s.id);const cc=m.conv>=60?VI.green:m.conv>=40?VI.yellow:VI.red;return(
+        {stores.map(s=>{const m=mx(s.id);const cc=m.conv>=60?VI.green:m.conv>=40?VI.yellow:VI.red;const barColor=s.active===false?VI.border:m.active>0?VI.green:VI.gold;return(
           <div key={s.id} onClick={()=>{setDetailStore(s);setTab("detail");}}
-            style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:7,cursor:"pointer",opacity:s.active===false?.5:1,transition:"border-color .2s"}}
+            style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,marginBottom:7,cursor:"pointer",opacity:s.active===false?.5:1,transition:"border-color .2s",display:"flex",overflow:"hidden"}}
             onMouseEnter={e=>e.currentTarget.style.borderColor=VI.terra}
             onMouseLeave={e=>e.currentTarget.style.borderColor=VI.border}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{width:3,flexShrink:0,background:barColor}}/>
+            <div style={{flex:1,padding:"13px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
               <div>
                 <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{s.name}</div>
                 {s.active===false?<div style={{fontSize:11,color:VI.muted,marginTop:2}}>Inativa</div>
