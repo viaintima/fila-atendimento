@@ -2630,7 +2630,7 @@ function SupervisaoDashboard({onLogout}) {
     const d=sessions[sid]||{queue:[],services:[]};
     const sv=d.services||[],q=d.queue||[];
     const sa=sv.filter(s=>s.isSale).length;
-    return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length,startedAt:d.startedAt};
+    return{svc:sv.length,sales:sa,conv:sv.length>0?Math.round((sa/sv.length)*100):0,active:q.filter(p=>p.status!=="done").length,startedAt:d.startedAt,queue:q,services:sv};
   };
   const queueTotals=stores.reduce((a,s)=>{const m=mxQ(s.id);a.svc+=m.svc;a.sales+=m.sales;return a;},{svc:0,sales:0});
   const queueConv=queueTotals.svc>0?Math.round((queueTotals.sales/queueTotals.svc)*100):0;
@@ -2678,17 +2678,22 @@ function SupervisaoDashboard({onLogout}) {
     };
     const q=mxQ(detailStore.id);
     return(<AppShell>
-      <Topbar title={detailStore.name} sub="Demandas da loja"
+      <Topbar title={detailStore.name} sub="Demandas e relatório do dia"
         actions={<>
           <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setDetailStore(null)}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn>
+          <Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(detailStore.name,q.queue,q.services,q.startedAt,items)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn>
           <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>openNew(detailStore.id)}><Icon name="plus" size={13} color="#fff"/>Nova demanda</Btn>
         </>}/>
       <StatsRow items={[{num:q.svc,label:"Atendimentos"},{num:q.sales,label:"Vendas",color:VI.green},{num:`${q.conv}%`,label:"Conversão"},{num:q.active,label:"Em turno"}]}/>
-      <div style={{padding:"14px 22px 60px"}}>
+      <div style={{padding:"14px 22px 0"}}>
         {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now}/>}
         <TaskSection title="Pendentes" items={groups.pendentes} now={now} empty="Nenhuma tarefa pendente"/>
         {groups.concluidas.length>0&&<TaskSection title="Concluídas hoje" items={groups.concluidas} now={now} dim/>}
       </div>
+      <div style={{padding:"6px 22px 0"}}>
+        <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginTop:16}}>Relatório do dia</div>
+      </div>
+      <ReportView services={q.services} queue={q.queue} tSvc={q.svc} tSales={q.sales} conv={q.conv} demands={items}/>
       {showNew&&<NewDemandModal stores={stores} storeId={newStoreId} setStoreId={setNewStoreId}
         quickIdx={quickIdx} onPickQuick={pickQuick}
         title={title} setTitle={setTitle} description={description} setDescription={setDescription}
