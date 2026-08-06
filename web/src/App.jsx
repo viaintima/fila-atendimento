@@ -278,9 +278,9 @@ const logisticsRef = id => doc(db,"logistics",id);
 const LOGISTICS_TRIGGER_OUTCOMES = ["sem_peca","sem_tamanho","sem_cor"];
 const LOGISTICS_STATUS = {
   PENDENTE:     { label:"Aguardando análise", color:"#2563eb", bg:"#EAF1FE" },
-  DISTRIBUICAO: { label:"Transferência",      color:VI.gold,   bg:VI.yellowBg },
+  DISTRIBUICAO: { label:"Distribuição",       color:VI.gold,   bg:VI.yellowBg },
   COMPRA:       { label:"Enviado p/ compra",  color:VI.terra,  bg:`${VI.blush}40` },
-  RESOLVIDO:    { label:"Resolvido",          color:VI.green,  bg:VI.greenBg },
+  RESOLVIDO:    { label:"Concluído",          color:VI.green,  bg:VI.greenBg },
   CANCELADO:    { label:"Cancelado",          color:VI.muted,  bg:VI.surfaceAlt },
 };
 const genLogisticsCode = () => `LOG-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).slice(2,4).toUpperCase()}`;
@@ -1876,6 +1876,7 @@ function AdminDashboard({onLogout}) {
   const [showResolvedCompras,setShowResolvedCompras]=useState(false);
   const [editingFornecedor,setEditingFornecedor]=useState(null);
   const [editFornecedorValue,setEditFornecedorValue]=useState("");
+  const [fornecedorFilter,setFornecedorFilter]=useState("");
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
@@ -2164,7 +2165,9 @@ function AdminDashboard({onLogout}) {
         if(!groups[key])groups[key]={reference:r.reference,fornecedor:r.fornecedor,items:[]};
         groups[key].items.push(r);
       });
-      const grouped=Object.values(groups).sort((a,b)=>b.items.length-a.items.length);
+      const allGrouped=Object.values(groups).sort((a,b)=>b.items.length-a.items.length);
+      const fornecedores=[...new Set(comprasPendentes.map(r=>r.fornecedor||"Sem fornecedor"))].sort((a,b)=>a.localeCompare(b));
+      const grouped=fornecedorFilter?allGrouped.filter(g=>(g.fornecedor||"Sem fornecedor")===fornecedorFilter):allGrouped;
       const resolved=logistics.filter(r=>r.status==="RESOLVIDO"||r.status==="CANCELADO").sort((a,b)=>new Date(b.resolvedAt)-new Date(a.resolvedAt));
 
       const markBought=async(ids)=>{
@@ -2182,7 +2185,7 @@ function AdminDashboard({onLogout}) {
         <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:14}}>
           <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Referências para comprar</div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:10,marginBottom:14}}>
-            {[{n:grouped.length,l:"Referências"},{n:comprasPendentes.length,l:"Pedidos em aberto"}].map((k,i)=>(
+            {[{n:allGrouped.length,l:"Referências"},{n:comprasPendentes.length,l:"Pedidos em aberto"}].map((k,i)=>(
               <div key={i} style={{textAlign:"center"}}>
                 <div style={{fontSize:22,fontWeight:700,color:VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{k.n}</div>
                 <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{k.l}</div>
@@ -2193,7 +2196,14 @@ function AdminDashboard({onLogout}) {
           <Inp value={buyerName} onChange={e=>setBuyerName(e.target.value)} placeholder="Quem está comprando" style={{marginBottom:0}}/>
         </div>
 
-        {grouped.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="tag" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma referência pendente de compra.</p></div>}
+        {fornecedores.length>1&&<div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14}}>
+          <button onClick={()=>setFornecedorFilter("")} style={{background:!fornecedorFilter?`${VI.terra}18`:"transparent",border:`1px solid ${!fornecedorFilter?VI.terra:VI.border}`,borderRadius:20,padding:"5px 12px",color:!fornecedorFilter?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:!fornecedorFilter?600:400}}>Todos os fornecedores</button>
+          {fornecedores.map(f=>(
+            <button key={f} onClick={()=>setFornecedorFilter(f)} style={{background:fornecedorFilter===f?`${VI.terra}18`:"transparent",border:`1px solid ${fornecedorFilter===f?VI.terra:VI.border}`,borderRadius:20,padding:"5px 12px",color:fornecedorFilter===f?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:fornecedorFilter===f?600:400}}>{f}</button>
+          ))}
+        </div>}
+
+        {grouped.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="tag" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>{fornecedorFilter?"Nenhuma referência deste fornecedor.":"Nenhuma referência pendente de compra."}</p></div>}
 
         {grouped.map(g=>{const gKey=`${g.reference}__${g.fornecedor}`;const ids=g.items.map(it=>it.id);return(
           <div key={gKey} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 16px",marginBottom:8}}>
@@ -2840,7 +2850,7 @@ function LogisticaDashboard({onLogout}){
   const [now,setNow]=useState(new Date());
   const [filter,setFilter]=useState("PENDENTE");
   const [actionModal,setActionModal]=useState(null); // {id, kind}
-  const [handledBy,setHandledBy]=useState("");
+  const [handledBy,setHandledBy]=useState("Juliana");
   const [transferFromStore,setTransferFromStore]=useState("");
   const [fornecedor,setFornecedor]=useState("");
   const [actionNote,setActionNote]=useState("");
@@ -2858,9 +2868,9 @@ function LogisticaDashboard({onLogout}){
   const filtered=requests.filter(r=>filter==="RESOLVIDO"?(r.status==="RESOLVIDO"||r.status==="CANCELADO"):r.status===filter);
   const FILTERS=[
     {id:"PENDENTE",label:"Pendentes",count:counts.PENDENTE},
-    {id:"DISTRIBUICAO",label:"Transferência",count:counts.DISTRIBUICAO},
+    {id:"DISTRIBUICAO",label:"Distribuição",count:counts.DISTRIBUICAO},
     {id:"COMPRA",label:"Compra",count:counts.COMPRA},
-    {id:"RESOLVIDO",label:"Resolvidos",count:counts.RESOLVIDO},
+    {id:"RESOLVIDO",label:"Concluídos",count:counts.RESOLVIDO},
   ];
 
   const openAction=(id,kind)=>{setActionModal({id,kind});setTransferFromStore("");setFornecedor("");setActionNote("");};
@@ -2927,11 +2937,11 @@ function LogisticaDashboard({onLogout}){
           {(r.status==="RESOLVIDO"||r.status==="CANCELADO")&&<div style={{fontSize:11,color:VI.muted,marginBottom:8}}>Tratado por {r.handledBy||"—"} em {fmtShort(r.resolvedAt)}</div>}
 
           {r.status==="PENDENTE"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            <Btn variant="dark" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"distribuir")}><Icon name="store" size={12} color={VI.cream}/>Transferir</Btn>
-            <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"comprar")}><Icon name="tag" size={12} color="#fff"/>Comprar</Btn>
+            <Btn variant="dark" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"distribuir")}><Icon name="store" size={12} color={VI.cream}/>Distribuição</Btn>
+            <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"comprar")}><Icon name="tag" size={12} color="#fff"/>Solicitar compra</Btn>
           </div>}
           {(r.status==="DISTRIBUICAO"||r.status==="COMPRA")&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>submitResolver(r.id)}><Icon name="check" size={12} color="#fff"/>Resolvido</Btn>
+            <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>submitResolver(r.id)}><Icon name="check" size={12} color="#fff"/>Concluído</Btn>
             <Btn variant="ghost" style={{color:VI.red,borderColor:`${VI.red}55`}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"cancelar")}>Cancelar</Btn>
           </div>}
           {!handledBy.trim()&&r.status!=="RESOLVIDO"&&r.status!=="CANCELADO"&&<div style={{fontSize:11,color:VI.muted,marginTop:6}}>Informe seu nome acima para tratar este pedido.</div>}
