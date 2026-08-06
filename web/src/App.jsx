@@ -276,12 +276,16 @@ const waMessage = (r) => {
 const logisticsCol = () => collection(db,"logistics");
 const logisticsRef = id => doc(db,"logistics",id);
 const LOGISTICS_TRIGGER_OUTCOMES = ["sem_peca","sem_tamanho","sem_cor"];
+// A distribuição em si acontece fora do app (no PDVnet/ERP). Aqui a Juliana só
+// junta as referências pedidas pelas lojas (PENDENTE), marca "Distribuição feita"
+// depois de resolver no ERP (vira DISTRIBUIDO) e, a partir daí, decide se aquela
+// referência também precisa ir para compra (COMPRA) ou se já pode concluir sem comprar.
 const LOGISTICS_STATUS = {
-  PENDENTE:     { label:"Aguardando análise", color:"#2563eb", bg:"#EAF1FE" },
-  DISTRIBUICAO: { label:"Distribuição",       color:VI.gold,   bg:VI.yellowBg },
-  COMPRA:       { label:"Enviado p/ compra",  color:VI.terra,  bg:`${VI.blush}40` },
-  RESOLVIDO:    { label:"Concluído",          color:VI.green,  bg:VI.greenBg },
-  CANCELADO:    { label:"Cancelado",          color:VI.muted,  bg:VI.surfaceAlt },
+  PENDENTE:     { label:"Aguardando distribuição", color:"#2563eb", bg:"#EAF1FE" },
+  DISTRIBUIDO:  { label:"Distribuição feita",       color:"#0F766E", bg:"#E6F5F3" },
+  COMPRA:       { label:"Enviado p/ compra",        color:VI.terra,  bg:`${VI.blush}40` },
+  RESOLVIDO:    { label:"Concluído",                color:VI.green,  bg:VI.greenBg },
+  CANCELADO:    { label:"Cancelado",                color:VI.muted,  bg:VI.surfaceAlt },
 };
 const genLogisticsCode = () => `LOG-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).slice(2,4).toUpperCase()}`;
 
@@ -291,18 +295,21 @@ async function createLogisticsRequest({storeId,storeName,sellerName,originalServ
     id:uid(), code:genLogisticsCode(),
     storeId, storeName, sellerName, originalServiceId,
     motivo, motivoLabel, reference:reference.trim(), desired:desired.trim(), note:note.trim(),
-    status:"PENDENTE", transferFromStore:null, fornecedor:null, purchaseNote:null, handledBy:null,
+    status:"PENDENTE", distributedAt:null, fornecedor:null, purchaseNote:null, handledBy:null,
     createdBy, createdAt:now, updatedAt:now, resolvedAt:null,
     history:[{id:uid(),action:"CRIADO",createdBy,createdAt:now,justification:""}],
   };
   await setDoc(logisticsRef(request.id), request);
   return request;
 }
-async function markLogisticsDistribution(id,{transferFromStore,note="",handledBy}){
+// Distribuição feita — a peça já foi resolvida no PDVnet/ERP, isso é só o registro
+// no app. Não fecha o pedido: ela ainda pode, depois, mandar essa referência pra
+// compras (ou concluir direto, se não precisar comprar reposição).
+async function markLogisticsDistribution(id,{note="",handledBy}){
   const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
   const r=snap.data(); const now=new Date().toISOString();
-  const hist={id:uid(),action:"DISTRIBUICAO",createdBy:handledBy,createdAt:now,justification:transferFromStore};
-  await setDoc(logisticsRef(id),{status:"DISTRIBUICAO",transferFromStore,note:note?`${r.note||""}\n${note}`.trim():r.note,handledBy,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+  const hist={id:uid(),action:"DISTRIBUICAO_CONCLUIDA",createdBy:handledBy,createdAt:now,justification:""};
+  await setDoc(logisticsRef(id),{status:"DISTRIBUIDO",distributedAt:now,note:note?`${r.note||""}\n${note}`.trim():r.note,handledBy,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
 }
 async function markLogisticsPurchase(id,{fornecedor,purchaseNote="",handledBy}){
   const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
@@ -2246,7 +2253,7 @@ function AdminDashboard({onLogout}) {
                   <span style={{fontSize:13,fontWeight:500,color:VI.carvao}}>{r.reference}</span>
                   <LogBadge status={r.status}/>
                 </div>
-                <div style={{fontSize:11,color:VI.muted,marginTop:3}}>{r.storeName} · {r.fornecedor?`fornecedor: ${r.fornecedor}`:r.transferFromStore?`transferido de ${r.transferFromStore}`:""} · tratado por {r.handledBy||"—"}</div>
+                <div style={{fontSize:11,color:VI.muted,marginTop:3}}>{r.storeName} · {r.fornecedor?`fornecedor: ${r.fornecedor}`:""} · tratado por {r.handledBy||"—"}</div>
               </div>
             ))}
           </div>}
@@ -2851,36 +2858,51 @@ function LogisticaDashboard({onLogout}){
   const [filter,setFilter]=useState("PENDENTE");
   const [actionModal,setActionModal]=useState(null); // {id, kind}
   const [handledBy,setHandledBy]=useState("Juliana");
-  const [transferFromStore,setTransferFromStore]=useState("");
   const [fornecedor,setFornecedor]=useState("");
   const [actionNote,setActionNote]=useState("");
   const [saving,setSaving]=useState(false);
+  const [busyId,setBusyId]=useState(null);
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(logisticsCol(),snap=>{setRequests(snap.docs.map(d=>d.data()).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)));});return()=>u();},[]);
 
   const counts={
     PENDENTE:requests.filter(r=>r.status==="PENDENTE").length,
-    DISTRIBUICAO:requests.filter(r=>r.status==="DISTRIBUICAO").length,
+    DISTRIBUIDO:requests.filter(r=>r.status==="DISTRIBUIDO").length,
     COMPRA:requests.filter(r=>r.status==="COMPRA").length,
     RESOLVIDO:requests.filter(r=>r.status==="RESOLVIDO"||r.status==="CANCELADO").length,
   };
-  const filtered=requests.filter(r=>filter==="RESOLVIDO"?(r.status==="RESOLVIDO"||r.status==="CANCELADO"):r.status===filter);
   const FILTERS=[
-    {id:"PENDENTE",label:"Pendentes",count:counts.PENDENTE},
-    {id:"DISTRIBUICAO",label:"Distribuição",count:counts.DISTRIBUICAO},
+    {id:"PENDENTE",label:"Distribuição",count:counts.PENDENTE},
+    {id:"DISTRIBUIDO",label:"Decidir compra",count:counts.DISTRIBUIDO},
     {id:"COMPRA",label:"Compra",count:counts.COMPRA},
     {id:"RESOLVIDO",label:"Concluídos",count:counts.RESOLVIDO},
   ];
+  const filtered=requests.filter(r=>filter==="RESOLVIDO"?(r.status==="RESOLVIDO"||r.status==="CANCELADO"):r.status===filter);
 
-  const openAction=(id,kind)=>{setActionModal({id,kind});setTransferFromStore("");setFornecedor("");setActionNote("");};
+  // Distribuição é a área principal: as referências pedidas pelas lojas são
+  // agrupadas aqui. A distribuição em si acontece fora do app (no PDVnet/ERP) —
+  // aqui a Juliana só marca "Distribuição feita" depois de resolver lá. O pedido
+  // então vai para "Decidir compra", onde ela escolhe se manda pra compras ou
+  // conclui sem comprar. "Solicitar compra" também continua disponível direto
+  // da Distribuição, para quando ela já sabe que vai precisar comprar.
+  const pendGroups={};
+  filtered.forEach(r=>{
+    if(filter!=="PENDENTE")return;
+    const key=r.reference||"—";
+    if(!pendGroups[key])pendGroups[key]={reference:key,items:[]};
+    pendGroups[key].items.push(r);
+  });
+  const pendGroupList=Object.values(pendGroups).sort((a,b)=>b.items.length-a.items.length);
+
+  const openAction=(id,kind)=>{setActionModal({id,kind});setFornecedor("");setActionNote("");};
   const closeAction=()=>setActionModal(null);
 
-  const submitDistribuicao=async()=>{
-    if(!actionModal||!transferFromStore.trim()||!handledBy.trim())return;
-    setSaving(true);
-    await markLogisticsDistribution(actionModal.id,{transferFromStore:transferFromStore.trim(),note:actionNote,handledBy:handledBy.trim()});
-    setSaving(false);closeAction();
+  const submitDistribuicaoDireta=async(id)=>{
+    if(!handledBy.trim())return;
+    setBusyId(id);
+    await markLogisticsDistribution(id,{handledBy:handledBy.trim()});
+    setBusyId(null);
   };
   const submitCompra=async()=>{
     if(!actionModal||!fornecedor.trim()||!handledBy.trim())return;
@@ -2890,7 +2912,9 @@ function LogisticaDashboard({onLogout}){
   };
   const submitResolver=async(id)=>{
     if(!handledBy.trim())return;
+    setBusyId(id);
     await resolveLogistics(id,{handledBy:handledBy.trim()});
+    setBusyId(null);
   };
   const submitCancelar=async()=>{
     if(!actionModal||!handledBy.trim())return;
@@ -2898,6 +2922,38 @@ function LogisticaDashboard({onLogout}){
     await cancelLogistics(actionModal.id,{reason:actionNote,handledBy:handledBy.trim()});
     setSaving(false);closeAction();
   };
+
+  const RequestCard=({r})=>(
+    <div key={r.id} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
+        <div style={{minWidth:0}}>
+          <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{r.reference}</div>
+          <div style={{fontSize:11,color:VI.muted,marginTop:1}}>{r.code} · {r.motivoLabel}</div>
+        </div>
+        <LogBadge status={r.status}/>
+      </div>
+      {r.desired&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Pretendido: {r.desired}</div>}
+      {r.note&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Obs: {r.note}</div>}
+      <div style={{fontSize:11,color:VI.muted,marginBottom:8}}>{r.storeName} · {r.sellerName} · {fmtShort(r.createdAt)} {fmtTime(r.createdAt)}</div>
+      {r.status==="DISTRIBUIDO"&&<div style={{fontSize:11,color:VI.muted,marginBottom:8}}>Distribuição feita por {r.handledBy||"—"} em {fmtShort(r.distributedAt)}</div>}
+      {r.status==="COMPRA"&&<div style={{fontSize:12,color:VI.carvao,marginBottom:8}}>Fornecedor: <strong>{r.fornecedor}</strong></div>}
+      {(r.status==="RESOLVIDO"||r.status==="CANCELADO")&&<div style={{fontSize:11,color:VI.muted,marginBottom:8}}>Tratado por {r.handledBy||"—"} em {fmtShort(r.resolvedAt)}</div>}
+
+      {r.status==="PENDENTE"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()||busyId===r.id} onClick={()=>submitDistribuicaoDireta(r.id)}><Icon name="check" size={12} color="#fff"/>{busyId===r.id?"Salvando…":"Distribuição feita"}</Btn>
+        <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"comprar")}><Icon name="tag" size={12} color="#fff"/>Solicitar compra</Btn>
+      </div>}
+      {r.status==="DISTRIBUIDO"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"comprar")}><Icon name="tag" size={12} color="#fff"/>Solicitar compra</Btn>
+        <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()||busyId===r.id} onClick={()=>submitResolver(r.id)}><Icon name="check" size={12} color="#fff"/>{busyId===r.id?"Salvando…":"Concluir sem compra"}</Btn>
+      </div>}
+      {r.status==="COMPRA"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()||busyId===r.id} onClick={()=>submitResolver(r.id)}><Icon name="check" size={12} color="#fff"/>Concluído</Btn>
+        <Btn variant="ghost" style={{color:VI.red,borderColor:`${VI.red}55`}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"cancelar")}>Cancelar</Btn>
+      </div>}
+      {!handledBy.trim()&&r.status!=="RESOLVIDO"&&r.status!=="CANCELADO"&&<div style={{fontSize:11,color:VI.muted,marginTop:6}}>Informe seu nome acima para tratar este pedido.</div>}
+    </div>
+  );
 
   return(<AppShell>
     <Topbar title="Logística" sub={<span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>}
@@ -2920,42 +2976,17 @@ function LogisticaDashboard({onLogout}){
 
     <div style={{padding:"0 22px 60px"}}>
       {filtered.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="package" size={30} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhum pedido nesta situação.</p></div>}
-      {filtered.map(r=>(
-        <div key={r.id} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:8}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
-            <div style={{minWidth:0}}>
-              <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{r.reference}</div>
-              <div style={{fontSize:11,color:VI.muted,marginTop:1}}>{r.code} · {r.motivoLabel}</div>
-            </div>
-            <LogBadge status={r.status}/>
+
+      {filter==="PENDENTE"?pendGroupList.map(g=>(
+        <div key={g.reference} style={{marginBottom:18}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+            <div style={{fontWeight:700,fontSize:13,color:VI.carvao}}>{g.reference}</div>
+            <div style={{fontSize:11,color:VI.muted,background:VI.surfaceAlt,borderRadius:20,padding:"2px 8px"}}>{g.items.length} {g.items.length===1?"pedido":"pedidos"}</div>
           </div>
-          {r.desired&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Pretendido: {r.desired}</div>}
-          {r.note&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Obs: {r.note}</div>}
-          <div style={{fontSize:11,color:VI.muted,marginBottom:8}}>{r.storeName} · {r.sellerName} · {fmtShort(r.createdAt)} {fmtTime(r.createdAt)}</div>
-          {r.status==="DISTRIBUICAO"&&<div style={{fontSize:12,color:VI.carvao,marginBottom:8}}>Transferir de: <strong>{r.transferFromStore}</strong></div>}
-          {r.status==="COMPRA"&&<div style={{fontSize:12,color:VI.carvao,marginBottom:8}}>Fornecedor: <strong>{r.fornecedor}</strong></div>}
-          {(r.status==="RESOLVIDO"||r.status==="CANCELADO")&&<div style={{fontSize:11,color:VI.muted,marginBottom:8}}>Tratado por {r.handledBy||"—"} em {fmtShort(r.resolvedAt)}</div>}
-
-          {r.status==="PENDENTE"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            <Btn variant="dark" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"distribuir")}><Icon name="store" size={12} color={VI.cream}/>Distribuição</Btn>
-            <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"comprar")}><Icon name="tag" size={12} color="#fff"/>Solicitar compra</Btn>
-          </div>}
-          {(r.status==="DISTRIBUICAO"||r.status==="COMPRA")&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>submitResolver(r.id)}><Icon name="check" size={12} color="#fff"/>Concluído</Btn>
-            <Btn variant="ghost" style={{color:VI.red,borderColor:`${VI.red}55`}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"cancelar")}>Cancelar</Btn>
-          </div>}
-          {!handledBy.trim()&&r.status!=="RESOLVIDO"&&r.status!=="CANCELADO"&&<div style={{fontSize:11,color:VI.muted,marginTop:6}}>Informe seu nome acima para tratar este pedido.</div>}
+          {g.items.map(r=><RequestCard key={r.id} r={r}/>)}
         </div>
-      ))}
+      )):filtered.map(r=><RequestCard key={r.id} r={r}/>)}
     </div>
-
-    {actionModal?.kind==="distribuir"&&<Modal onClose={closeAction}>
-      <MIcon name="store"/>
-      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Transferir de outra loja</h2>
-      <Inp autoFocus value={transferFromStore} onChange={e=>setTransferFromStore(e.target.value)} placeholder="De qual loja vem a peça?*"/>
-      <Inp value={actionNote} onChange={e=>setActionNote(e.target.value)} placeholder="Observação (opcional)"/>
-      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="accent" disabled={!transferFromStore.trim()||saving} onClick={submitDistribuicao}>{saving?"Salvando…":"Confirmar transferência"}</Btn></div>
-    </Modal>}
 
     {actionModal?.kind==="comprar"&&<Modal onClose={closeAction}>
       <MIcon name="tag"/>
