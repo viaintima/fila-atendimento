@@ -32,7 +32,7 @@ const MAIN_OUTCOMES = [
 const SUB_OUTCOMES = [
   { id:"reservou",    label:"Reservou para outro dia", detail:false },
   { id:"preco",       label:"Preço Elevado",           detail:false },
-  { id:"sem_peca",    label:"Não tinha a peça",        detail:true, detailLabel:"Qual peça?" },
+  { id:"sem_peca",    label:"Não tinha a peça",        detail:false },
   { id:"sem_tamanho", label:"Não tinha o tamanho",     detail:false },
   { id:"sem_cor",     label:"Não tinha a cor",         detail:false },
   { id:"olhando",     label:"Estava só olhando",       detail:false },
@@ -51,6 +51,7 @@ const storeRef   = id => doc(db,"stores",id);
 const sessionRef = id => doc(db,"sessions",id);
 const adminRef   = ()  => doc(db,"config","admin");
 const supervisaoRef = () => doc(db,"config","supervisao");
+const logisticaConfigRef = () => doc(db,"config","logistica");
 const historyCol = id => collection(db,"history",id,"days");
 const histDayRef = (s,d) => doc(db,"history",s,"days",d);
 const demandsRef = id => doc(db,"demands",id);
@@ -264,6 +265,69 @@ const waMessage = (r) => {
   const prazo=r.expiresAt?new Date(r.expiresAt).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):"";
   return `Olá, ${r.customerName}! Aqui é ${r.currentResponsibleName}, da Via Íntima ${r.storeName}. Conforme combinamos, deixamos reservados para você: ${items}. Sua reserva ficará disponível até ${prazo}. Se precisar, pode falar com a gente por aqui.`;
 };
+
+// ──────────────────────────────────────────
+// Logística — quando a venda é perdida por falta de peça/tamanho/cor, a
+// vendedora informa a referência e o tamanho/cor pretendido, e um pedido
+// abre imediatamente para a aux logística: verificar se dá pra transferir
+// de outra loja ou se precisa mandar comprar. Coleção única no topo (não
+// por loja), como reservations — a aux logística precisa ver tudo de uma vez.
+// ──────────────────────────────────────────
+const logisticsCol = () => collection(db,"logistics");
+const logisticsRef = id => doc(db,"logistics",id);
+const LOGISTICS_TRIGGER_OUTCOMES = ["sem_peca","sem_tamanho","sem_cor"];
+const LOGISTICS_STATUS = {
+  PENDENTE:     { label:"Aguardando análise", color:"#2563eb", bg:"#EAF1FE" },
+  DISTRIBUICAO: { label:"Transferência",      color:VI.gold,   bg:VI.yellowBg },
+  COMPRA:       { label:"Enviado p/ compra",  color:VI.terra,  bg:`${VI.blush}40` },
+  RESOLVIDO:    { label:"Resolvido",          color:VI.green,  bg:VI.greenBg },
+  CANCELADO:    { label:"Cancelado",          color:VI.muted,  bg:VI.surfaceAlt },
+};
+const genLogisticsCode = () => `LOG-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).slice(2,4).toUpperCase()}`;
+
+async function createLogisticsRequest({storeId,storeName,sellerName,originalServiceId=null,motivo,motivoLabel,reference,desired="",note="",createdBy}){
+  const now=new Date().toISOString();
+  const request={
+    id:uid(), code:genLogisticsCode(),
+    storeId, storeName, sellerName, originalServiceId,
+    motivo, motivoLabel, reference:reference.trim(), desired:desired.trim(), note:note.trim(),
+    status:"PENDENTE", transferFromStore:null, fornecedor:null, purchaseNote:null, handledBy:null,
+    createdBy, createdAt:now, updatedAt:now, resolvedAt:null,
+    history:[{id:uid(),action:"CRIADO",createdBy,createdAt:now,justification:""}],
+  };
+  await setDoc(logisticsRef(request.id), request);
+  return request;
+}
+async function markLogisticsDistribution(id,{transferFromStore,note="",handledBy}){
+  const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
+  const r=snap.data(); const now=new Date().toISOString();
+  const hist={id:uid(),action:"DISTRIBUICAO",createdBy:handledBy,createdAt:now,justification:transferFromStore};
+  await setDoc(logisticsRef(id),{status:"DISTRIBUICAO",transferFromStore,note:note?`${r.note||""}\n${note}`.trim():r.note,handledBy,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+async function markLogisticsPurchase(id,{fornecedor,purchaseNote="",handledBy}){
+  const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
+  const r=snap.data(); const now=new Date().toISOString();
+  const hist={id:uid(),action:"COMPRA",createdBy:handledBy,createdAt:now,justification:fornecedor};
+  await setDoc(logisticsRef(id),{status:"COMPRA",fornecedor,purchaseNote,handledBy,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+async function resolveLogistics(id,{handledBy}){
+  const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
+  const r=snap.data(); const now=new Date().toISOString();
+  const hist={id:uid(),action:"RESOLVIDO",createdBy:handledBy,createdAt:now,justification:""};
+  await setDoc(logisticsRef(id),{status:"RESOLVIDO",resolvedAt:now,handledBy,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+async function cancelLogistics(id,{reason="",handledBy}){
+  const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
+  const r=snap.data(); const now=new Date().toISOString();
+  const hist={id:uid(),action:"CANCELADO",createdBy:handledBy,createdAt:now,justification:reason};
+  await setDoc(logisticsRef(id),{status:"CANCELADO",resolvedAt:now,handledBy,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
+async function updateLogisticsFornecedor(id,{fornecedor,handledBy}){
+  const snap=await getDoc(logisticsRef(id)); if(!snap.exists())return;
+  const r=snap.data(); const now=new Date().toISOString();
+  const hist={id:uid(),action:"FORNECEDOR_EDITADO",createdBy:handledBy,createdAt:now,justification:fornecedor};
+  await setDoc(logisticsRef(id),{fornecedor,history:[...(r.history||[]),hist],updatedAt:now},{merge:true});
+}
 
 // ──────────────────────────────────────────
 // Tarefas com SLA — checklist de abertura/fechamento + demandas avulsas
@@ -511,14 +575,15 @@ export default function App() {
   const [screen,setScreen]=useState("login");
   const [store,setStore]=useState(null);
   return (<>
-    {screen==="login"&&<LoginPage onStore={s=>{setStore(s);setScreen("store");}} onAdmin={()=>setScreen("admin")} onSupervisao={()=>setScreen("supervisao")}/>}
+    {screen==="login"&&<LoginPage onStore={s=>{setStore(s);setScreen("store");}} onAdmin={()=>setScreen("admin")} onSupervisao={()=>setScreen("supervisao")} onLogistica={()=>setScreen("logistica")}/>}
     {screen==="store"&&<StoreApp store={store} onLogout={()=>{setStore(null);setScreen("login");}}/>}
     {screen==="admin"&&<AdminDashboard onLogout={()=>setScreen("login")}/>}
     {screen==="supervisao"&&<SupervisaoDashboard onLogout={()=>setScreen("login")}/>}
+    {screen==="logistica"&&<LogisticaDashboard onLogout={()=>setScreen("login")}/>}
   </>);
 }
 
-function LoginPage({onStore,onAdmin,onSupervisao}) {
+function LoginPage({onStore,onAdmin,onSupervisao,onLogistica}) {
   const [tab,setTab]=useState("store");
   const [stores,setStores]=useState([]);
   const [storeId,setStoreId]=useState("");
@@ -529,6 +594,9 @@ function LoginPage({onStore,onAdmin,onSupervisao}) {
   const [supPin,setSupPin]=useState("");
   const [newSupPin,setNewSupPin]=useState("");
   const [firstRunSup,setFirstRunSup]=useState(null);
+  const [logPin,setLogPin]=useState("");
+  const [newLogPin,setNewLogPin]=useState("");
+  const [firstRunLog,setFirstRunLog]=useState(null);
   const [err,setErr]=useState("");
   const [busy,setBusy]=useState(false);
 
@@ -540,6 +608,7 @@ function LoginPage({onStore,onAdmin,onSupervisao}) {
   },[]);
   useEffect(()=>{getDoc(adminRef()).then(d=>setFirstRun(!d.exists()));},[]);
   useEffect(()=>{getDoc(supervisaoRef()).then(d=>setFirstRunSup(!d.exists()));},[]);
+  useEffect(()=>{getDoc(logisticaConfigRef()).then(d=>setFirstRunLog(!d.exists()));},[]);
 
   const loginStore=async()=>{
     setErr("");setBusy(true);
@@ -571,8 +640,19 @@ function LoginPage({onStore,onAdmin,onSupervisao}) {
     if(newSupPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
     await setDoc(supervisaoRef(),{pin:newSupPin}); onSupervisao();
   };
+  const loginLogistica=async()=>{
+    setErr("");setBusy(true);
+    if(!logPin){setErr("Digite o PIN.");setBusy(false);return;}
+    const snap=await getDoc(logisticaConfigRef());
+    if(!snap.exists()||snap.data().pin!==logPin){setErr("PIN incorreto.");setBusy(false);return;}
+    onLogistica();
+  };
+  const createLogPin=async()=>{
+    if(newLogPin.length<4){setErr("PIN deve ter pelo menos 4 dígitos.");return;}
+    await setDoc(logisticaConfigRef(),{pin:newLogPin}); onLogistica();
+  };
 
-  if(firstRun===null||firstRunSup===null) return (
+  if(firstRun===null||firstRunSup===null||firstRunLog===null) return (
     <div style={{minHeight:"100vh",background:VI.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
       <style>{CSS}</style>
       <div style={{width:24,height:24,border:`2px solid ${VI.border}`,borderTopColor:VI.terra,borderRadius:"50%",animation:"spin .7s linear infinite"}}/>
@@ -592,9 +672,9 @@ function LoginPage({onStore,onAdmin,onSupervisao}) {
         </div>
 
         <div style={{display:"flex",background:VI.surface,borderRadius:10,padding:3,marginBottom:18,border:`1px solid ${VI.border}`}}>
-          {[["store","Loja"],["supervisao","Supervisão"],["admin","Administrador"]].map(([t,l])=>(
+          {[["store","Loja"],["supervisao","Supervisão"],["logistica","Logística"],["admin","Administrador"]].map(([t,l])=>(
             <button key={t} onClick={()=>{setTab(t);setErr("");}}
-              style={{flex:1,padding:"10px 0",border:"none",borderRadius:8,fontFamily:"inherit",fontSize:13,fontWeight:500,cursor:"pointer",
+              style={{flex:1,padding:"10px 0",border:"none",borderRadius:8,fontFamily:"inherit",fontSize:12,fontWeight:500,cursor:"pointer",
                       background:tab===t?VI.terra:"transparent",color:tab===t?"#fff":VI.muted,transition:"all .2s"}}>
               {l}
             </button>
@@ -638,6 +718,24 @@ function LoginPage({onStore,onAdmin,onSupervisao}) {
                     onChange={e=>setSupPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&loginSupervisao()}/>
                {err&&<p style={{color:VI.red,fontSize:12,marginBottom:10}}>{err}</p>}
                <Btn variant="primary" style={{width:"100%"}} disabled={busy} onClick={loginSupervisao}>
+                 {busy?"Verificando…":"Acessar painel"}
+               </Btn>
+             </>
+          )}
+          {tab==="logistica"&&(firstRunLog
+            ?<>
+               <p style={{color:VI.muted,fontSize:13,marginBottom:16,lineHeight:1.6}}>Primeira vez — crie o PIN de logística.</p>
+               <Inp type="password" placeholder="Criar PIN (mín. 4 dígitos)" value={newLogPin}
+                    onChange={e=>setNewLogPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&createLogPin()}/>
+               {err&&<p style={{color:VI.red,fontSize:12,marginBottom:10}}>{err}</p>}
+               <Btn variant="primary" style={{width:"100%"}} onClick={createLogPin}>Criar PIN e entrar</Btn>
+             </>
+            :<>
+               <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>PIN de logística</p>
+               <Inp type="password" placeholder="PIN de logística" value={logPin} autoFocus
+                    onChange={e=>setLogPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&loginLogistica()}/>
+               {err&&<p style={{color:VI.red,fontSize:12,marginBottom:10}}>{err}</p>}
+               <Btn variant="primary" style={{width:"100%"}} disabled={busy} onClick={loginLogistica}>
                  {busy?"Verificando…":"Acessar painel"}
                </Btn>
              </>
@@ -703,6 +801,8 @@ function StoreApp({store,onLogout}) {
   const [resContactNotes,setResContactNotes]=useState("");
   const [resActionModal,setResActionModal]=useState(null); // "convert" | "partial" | "returned" | "cancel" | "lose" | "extend"
   const [resActionState,setResActionState]=useState({});
+  const [logModal,setLogModal]=useState(null); // {motivo,motivoLabel,originalServiceId,sellerName,reference,desired,note}
+  const [logSaving,setLogSaving]=useState(false);
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{
@@ -841,6 +941,32 @@ function StoreApp({store,onLogout}) {
     // O atendimento continua registrado como não-venda no dia de hoje; a
     // reserva é um registro à parte, ligada a ele por originalServiceId.
     if(oId==="reservou")openNewReservation(finishedSvc);
+    // Perdeu a venda por falta de peça/tamanho/cor: abre na hora o pedido
+    // para a Logística verificar transferência ou mandar comprar.
+    if(LOGISTICS_TRIGGER_OUTCOMES.includes(oId))openLogisticsRequest(finishedSvc,oId);
+  };
+
+  // ── Logística — falta de peça/tamanho/cor ───────────────────────
+  const openLogisticsRequest=(finishedSvc,oId)=>{
+    const sub=SUB_OUTCOMES.find(o=>o.id===oId);
+    setLogModal({
+      originalServiceId:finishedSvc.id, sellerName:finishedSvc.salespersonName,
+      motivo:oId, motivoLabel:sub?.label||oId, reference:"", desired:"", note:"",
+    });
+  };
+  const updateLogModal=(field,val)=>setLogModal(m=>({...m,[field]:val}));
+  const closeLogModal=()=>setLogModal(null);
+  const submitLogisticsRequest=async()=>{
+    if(!logModal||!logModal.reference.trim()||logSaving)return;
+    setLogSaving(true);
+    try{
+      await createLogisticsRequest({
+        storeId:store.id,storeName:store.name,sellerName:logModal.sellerName,originalServiceId:logModal.originalServiceId,
+        motivo:logModal.motivo,motivoLabel:logModal.motivoLabel,reference:logModal.reference,desired:logModal.desired,note:logModal.note,
+        createdBy:logModal.sellerName,
+      });
+      setLogModal(null);
+    }finally{setLogSaving(false);}
   };
 
   // ── Reservas de clientes ──────────────────────────────────────
@@ -1187,6 +1313,21 @@ function StoreApp({store,onLogout}) {
         <Btn variant="ghost" onClick={closeTask}>Cancelar</Btn>
         <Btn variant="success" style={{display:"flex",alignItems:"center",gap:6}} disabled={!taskWho} onClick={completeTask}>
           <Icon name="check" size={14} color="#fff"/> Marcar como concluída
+        </Btn>
+      </div>
+    </Modal>}
+
+    {logModal&&<Modal closeable={false}>
+      <MIcon name="package"/>
+      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>Pedido para a Logística</h2>
+      <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>Motivo: <strong style={{color:VI.carvao}}>{logModal.motivoLabel}</strong> — a aux logística verifica agora se dá pra transferir de outra loja ou se precisa comprar.</p>
+      <Inp autoFocus value={logModal.reference} onChange={e=>updateLogModal("reference",e.target.value)} placeholder="Referência da peça*"/>
+      <Inp value={logModal.desired} onChange={e=>updateLogModal("desired",e.target.value)} placeholder="Tamanho/cor pretendido (opcional)"/>
+      <Inp value={logModal.note} onChange={e=>updateLogModal("note",e.target.value)} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+        <Btn variant="ghost" onClick={closeLogModal}>Não enviar</Btn>
+        <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:6}} disabled={!logModal.reference.trim()||logSaving} onClick={submitLogisticsRequest}>
+          <Icon name="package" size={14} color="#fff"/>{logSaving?"Enviando…":"Enviar para Logística"}
         </Btn>
       </div>
     </Modal>}
@@ -1730,12 +1871,19 @@ function AdminDashboard({onLogout}) {
   const [teamStore,setTeamStore]=useState(null);
   const [newMemberName,setNewMemberName]=useState("");
   const [reservations,setReservations]=useState([]);
+  const [logistics,setLogistics]=useState([]);
+  const [buyerName,setBuyerName]=useState("");
+  const [showResolvedCompras,setShowResolvedCompras]=useState(false);
+  const [editingFornecedor,setEditingFornecedor]=useState(null);
+  const [editFornecedorValue,setEditFornecedorValue]=useState("");
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
   // Reservas — coleção única no topo (não por loja), então carregamos tudo aqui
   // e filtramos por loja/período no cliente (mesmo padrão do dashboard geral).
   useEffect(()=>{const u=onSnapshot(reservationsCol(),snap=>{setReservations(snap.docs.map(d=>d.data()));});return()=>u();},[]);
+  // Logística/Compras — idem, coleção única no topo.
+  useEffect(()=>{const u=onSnapshot(logisticsCol(),snap=>{setLogistics(snap.docs.map(d=>d.data()));});return()=>u();},[]);
   useEffect(()=>{if(stores.length===0)return;const us=stores.map(s=>onSnapshot(sessionRef(s.id),snap=>{setSessions(prev=>({...prev,[s.id]:snap.exists()?snap.data():{queue:[],services:[]}}));}));return()=>us.forEach(u=>u());},[stores]);
   useEffect(()=>{if(stores.length===0)return;const us=stores.map(s=>onSnapshot(demandsRef(s.id),snap=>{setDemandsLive(prev=>({...prev,[s.id]:snap.exists()?(snap.data().items||[]):[]}));}));return()=>us.forEach(u=>u());},[stores]);
 
@@ -1945,7 +2093,8 @@ function AdminDashboard({onLogout}) {
     await setDoc(storeRef(teamStore.id),{roster:nr},{merge:true});
   };
 
-  const TABS=[{id:"overview",label:"Hoje",icon:"chart"},{id:"dashboard",label:"Dashboard",icon:"trend"},{id:"ponto",label:"Ponto",icon:"clock"},{id:"history",label:"Histórico",icon:"cal"},{id:"stores",label:"Lojas",icon:"store"}];
+  const comprasPendentes=logistics.filter(r=>r.status==="COMPRA");
+  const TABS=[{id:"overview",label:"Hoje",icon:"chart"},{id:"dashboard",label:"Dashboard",icon:"trend"},{id:"compras",label:"Compras",icon:"tag",badge:comprasPendentes.length},{id:"ponto",label:"Ponto",icon:"clock"},{id:"history",label:"Histórico",icon:"cal"},{id:"stores",label:"Lojas",icon:"store"}];
 
   if(tab==="detail"&&detailStore){const m=mx(detailStore.id);const dm=demandsLive[detailStore.id]||[];return(<AppShell><Topbar title={detailStore.name} sub={`Dia atual · desde ${fmtTime(m.startedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("overview")}><Icon name="back" size={13} color={VI.muted}/>Painel</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(detailStore.name,m.queue,m.services,m.startedAt,dm)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:m.svc,label:"Atendimentos"},{num:m.sales,label:"Vendas",color:VI.green},{num:`${m.conv}%`,label:"Conversão"},{num:m.active,label:"Em turno"}]}/><ReportView services={m.services} queue={m.queue} tSvc={m.svc} tSales={m.sales} conv={m.conv} demands={dm}/></AppShell>);}
   if(tab==="histDetail"&&detailRec){const{storeName,record:rec}=detailRec;const sv=rec.services||[],q=rec.queue||[],dm=rec.demands||[];const ts=sv.length,tsa=sv.filter(s=>s.isSale).length,cr=ts>0?Math.round((tsa/ts)*100):0;return(<AppShell><Topbar title={storeName} sub={`${fmtShort(rec.startedAt)} · ${fmtTime(rec.startedAt)} – ${fmtTime(rec.closedAt)}`} actions={<><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>setTab("history")}><Icon name="back" size={13} color={VI.muted}/>Histórico</Btn><Btn variant="ghost" style={{display:"flex",alignItems:"center",gap:5}} onClick={()=>exportPDF(storeName,q,sv,rec.startedAt,dm)}><Icon name="print" size={13} color={VI.muted}/>PDF</Btn></>}/><StatsRow items={[{num:ts,label:"Atendimentos"},{num:tsa,label:"Vendas",color:VI.green},{num:`${cr}%`,label:"Conversão"},{num:q.length,label:"Funcionárias"}]}/><ReportView services={sv} queue={q} tSvc={ts} tSales={tsa} conv={cr} demands={dm}/></AppShell>);}
@@ -1963,6 +2112,7 @@ function AdminDashboard({onLogout}) {
                   color:active?VI.terra:VI.muted,fontSize:12,fontWeight:active?600:500,
                   cursor:"pointer",fontFamily:"inherit",flexShrink:0,whiteSpace:"nowrap"}}>
           <Icon name={t.icon} size={13} color={active?VI.terra:VI.muted}/>{t.label}
+          {t.badge>0&&<span style={{fontSize:10,fontWeight:700,background:VI.terra,color:"#fff",borderRadius:99,padding:"1px 6px",marginLeft:1}}>{t.badge}</span>}
         </button>);
       })}
     </div>
@@ -2004,6 +2154,95 @@ function AdminDashboard({onLogout}) {
         );})}
       </div>
     </>}
+
+    {tab==="compras"&&(()=>{
+      // Agrupa por referência — a mesma peça pode ter sido pedida por mais de
+      // uma loja, e o Admin quer ver a lista de compra consolidada.
+      const groups={};
+      comprasPendentes.forEach(r=>{
+        const key=`${r.reference}__${r.fornecedor||""}`;
+        if(!groups[key])groups[key]={reference:r.reference,fornecedor:r.fornecedor,items:[]};
+        groups[key].items.push(r);
+      });
+      const grouped=Object.values(groups).sort((a,b)=>b.items.length-a.items.length);
+      const resolved=logistics.filter(r=>r.status==="RESOLVIDO"||r.status==="CANCELADO").sort((a,b)=>new Date(b.resolvedAt)-new Date(a.resolvedAt));
+
+      const markBought=async(ids)=>{
+        if(!buyerName.trim())return;
+        for(const id of ids)await resolveLogistics(id,{handledBy:buyerName.trim()});
+      };
+      const startEditFornecedor=(key,current)=>{setEditingFornecedor(key);setEditFornecedorValue(current||"");};
+      const saveFornecedor=async(ids)=>{
+        if(!editFornecedorValue.trim()||!buyerName.trim())return;
+        for(const id of ids)await updateLogisticsFornecedor(id,{fornecedor:editFornecedorValue.trim(),handledBy:buyerName.trim()});
+        setEditingFornecedor(null);
+      };
+
+      return(<div style={{padding:"18px 22px"}}>
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Referências para comprar</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:10,marginBottom:14}}>
+            {[{n:grouped.length,l:"Referências"},{n:comprasPendentes.length,l:"Pedidos em aberto"}].map((k,i)=>(
+              <div key={i} style={{textAlign:"center"}}>
+                <div style={{fontSize:22,fontWeight:700,color:VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{k.n}</div>
+                <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{k.l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Seu nome (para marcar como comprado)</div>
+          <Inp value={buyerName} onChange={e=>setBuyerName(e.target.value)} placeholder="Quem está comprando" style={{marginBottom:0}}/>
+        </div>
+
+        {grouped.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="tag" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhuma referência pendente de compra.</p></div>}
+
+        {grouped.map(g=>{const gKey=`${g.reference}__${g.fornecedor}`;const ids=g.items.map(it=>it.id);return(
+          <div key={gKey} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 16px",marginBottom:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:600,fontSize:15,color:VI.carvao}}>{g.reference}</div>
+                {editingFornecedor===gKey
+                  ?<div style={{display:"flex",gap:6,marginTop:6}}>
+                     <Inp autoFocus value={editFornecedorValue} onChange={e=>setEditFornecedorValue(e.target.value)} placeholder="Fornecedor" style={{marginBottom:0,flex:1}}/>
+                     <Btn variant="accent" style={{flexShrink:0}} disabled={!editFornecedorValue.trim()||!buyerName.trim()} onClick={()=>saveFornecedor(ids)}>Salvar</Btn>
+                     <Btn variant="ghost" style={{flexShrink:0}} onClick={()=>setEditingFornecedor(null)}>Cancelar</Btn>
+                   </div>
+                  :<div style={{fontSize:12,color:VI.muted,marginTop:2,display:"flex",alignItems:"center",gap:6}}>
+                     Fornecedor: <strong style={{color:VI.carvao}}>{g.fornecedor||"—"}</strong>
+                     <button onClick={()=>startEditFornecedor(gKey,g.fornecedor)} style={{background:"none",border:"none",cursor:"pointer",padding:2,display:"flex"}} title="Editar fornecedor"><Icon name="edit" size={11} color={VI.muted}/></button>
+                   </div>}
+              </div>
+              <span style={{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:5,background:VI.surfaceAlt,color:VI.muted,whiteSpace:"nowrap"}}>{g.items.length} pedido{g.items.length!==1?"s":""}</span>
+            </div>
+            {g.items.map(it=>(
+              <div key={it.id} style={{fontSize:12,color:VI.muted,borderTop:`1px solid ${VI.border}`,paddingTop:6,marginTop:6}}>
+                {it.storeName} · {it.sellerName}{it.desired?` · pretendido: ${it.desired}`:""} · {fmtShort(it.createdAt)}
+              </div>
+            ))}
+            <Btn variant="success" style={{width:"100%",marginTop:10,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}
+              disabled={!buyerName.trim()} onClick={()=>markBought(ids)}>
+              <Icon name="check" size={13} color="#fff"/>Marcar como comprado
+            </Btn>
+          </div>
+        );})}
+
+        {resolved.length>0&&<div style={{marginTop:18}}>
+          <button onClick={()=>setShowResolvedCompras(v=>!v)} style={{display:"flex",alignItems:"center",gap:6,background:"none",border:"none",color:VI.terra,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",padding:0}}>
+            <Icon name={showResolvedCompras?"chevD":"chevR"} size={12} color={VI.terra}/>Histórico ({resolved.length})
+          </button>
+          {showResolvedCompras&&<div style={{marginTop:10}}>
+            {resolved.map(r=>(
+              <div key={r.id} style={{background:VI.surfaceAlt,border:`1px solid ${VI.border}`,borderRadius:8,padding:"10px 13px",marginBottom:5}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontSize:13,fontWeight:500,color:VI.carvao}}>{r.reference}</span>
+                  <LogBadge status={r.status}/>
+                </div>
+                <div style={{fontSize:11,color:VI.muted,marginTop:3}}>{r.storeName} · {r.fornecedor?`fornecedor: ${r.fornecedor}`:r.transferFromStore?`transferido de ${r.transferFromStore}`:""} · tratado por {r.handledBy||"—"}</div>
+              </div>
+            ))}
+          </div>}
+        </div>}
+      </div>);
+    })()}
 
     {tab==="history"&&<div style={{padding:"18px 22px"}}>
       <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:12}}>Dias encerrados</div>
@@ -2583,6 +2822,140 @@ function SupervisaoDashboard({onLogout}) {
       dueDate={dueDate} setDueDate={setDueDate} dueTime={dueTime} setDueTime={setDueTime}
       assignTo={assignTo} setAssignTo={setAssignTo}
       saving={saving} onCancel={()=>setShowNew(false)} onCreate={createDemand}/>}
+  </AppShell>);
+}
+
+function LogBadge({status}){
+  const m=LOGISTICS_STATUS[status]||LOGISTICS_STATUS.PENDENTE;
+  return <span style={{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:5,background:m.bg,color:m.color,whiteSpace:"nowrap"}}>{m.label}</span>;
+}
+
+function LogisticaDashboard({onLogout}){
+  const [requests,setRequests]=useState([]);
+  const [now,setNow]=useState(new Date());
+  const [filter,setFilter]=useState("PENDENTE");
+  const [actionModal,setActionModal]=useState(null); // {id, kind}
+  const [handledBy,setHandledBy]=useState("");
+  const [transferFromStore,setTransferFromStore]=useState("");
+  const [fornecedor,setFornecedor]=useState("");
+  const [actionNote,setActionNote]=useState("");
+  const [saving,setSaving]=useState(false);
+
+  useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
+  useEffect(()=>{const u=onSnapshot(logisticsCol(),snap=>{setRequests(snap.docs.map(d=>d.data()).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)));});return()=>u();},[]);
+
+  const counts={
+    PENDENTE:requests.filter(r=>r.status==="PENDENTE").length,
+    DISTRIBUICAO:requests.filter(r=>r.status==="DISTRIBUICAO").length,
+    COMPRA:requests.filter(r=>r.status==="COMPRA").length,
+    RESOLVIDO:requests.filter(r=>r.status==="RESOLVIDO"||r.status==="CANCELADO").length,
+  };
+  const filtered=requests.filter(r=>filter==="RESOLVIDO"?(r.status==="RESOLVIDO"||r.status==="CANCELADO"):r.status===filter);
+  const FILTERS=[
+    {id:"PENDENTE",label:"Pendentes",count:counts.PENDENTE},
+    {id:"DISTRIBUICAO",label:"Transferência",count:counts.DISTRIBUICAO},
+    {id:"COMPRA",label:"Compra",count:counts.COMPRA},
+    {id:"RESOLVIDO",label:"Resolvidos",count:counts.RESOLVIDO},
+  ];
+
+  const openAction=(id,kind)=>{setActionModal({id,kind});setTransferFromStore("");setFornecedor("");setActionNote("");};
+  const closeAction=()=>setActionModal(null);
+
+  const submitDistribuicao=async()=>{
+    if(!actionModal||!transferFromStore.trim()||!handledBy.trim())return;
+    setSaving(true);
+    await markLogisticsDistribution(actionModal.id,{transferFromStore:transferFromStore.trim(),note:actionNote,handledBy:handledBy.trim()});
+    setSaving(false);closeAction();
+  };
+  const submitCompra=async()=>{
+    if(!actionModal||!fornecedor.trim()||!handledBy.trim())return;
+    setSaving(true);
+    await markLogisticsPurchase(actionModal.id,{fornecedor:fornecedor.trim(),purchaseNote:actionNote,handledBy:handledBy.trim()});
+    setSaving(false);closeAction();
+  };
+  const submitResolver=async(id)=>{
+    if(!handledBy.trim())return;
+    await resolveLogistics(id,{handledBy:handledBy.trim()});
+  };
+  const submitCancelar=async()=>{
+    if(!actionModal||!handledBy.trim())return;
+    setSaving(true);
+    await cancelLogistics(actionModal.id,{reason:actionNote,handledBy:handledBy.trim()});
+    setSaving(false);closeAction();
+  };
+
+  return(<AppShell>
+    <Topbar title="Logística" sub={<span style={{textTransform:"capitalize"}}>{fmtDate(now)}</span>}
+      actions={<Btn variant="ghost" style={{padding:"9px 10px",display:"flex",alignItems:"center"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>}/>
+
+    <div style={{padding:"14px 22px 0"}}>
+      <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Seu nome (para o histórico)</div>
+      <Inp value={handledBy} onChange={e=>setHandledBy(e.target.value)} placeholder="Nome de quem está tratando os pedidos"/>
+    </div>
+
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,padding:"0 22px 14px"}}>
+      {FILTERS.map(f=>(
+        <button key={f.id} onClick={()=>setFilter(f.id)}
+          style={{background:filter===f.id?`${VI.terra}12`:VI.surface,border:`1px solid ${filter===f.id?VI.terra:VI.border}`,borderRadius:12,padding:"12px 6px",textAlign:"center",cursor:"pointer",fontFamily:"inherit"}}>
+          <div style={{fontSize:20,fontWeight:700,color:filter===f.id?VI.terra:VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{f.count}</div>
+          <div style={{fontSize:9,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{f.label}</div>
+        </button>
+      ))}
+    </div>
+
+    <div style={{padding:"0 22px 60px"}}>
+      {filtered.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="package" size={30} color={VI.border} sw={1}/><p style={{marginTop:10}}>Nenhum pedido nesta situação.</p></div>}
+      {filtered.map(r=>(
+        <div key={r.id} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 16px",marginBottom:8}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
+            <div style={{minWidth:0}}>
+              <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{r.reference}</div>
+              <div style={{fontSize:11,color:VI.muted,marginTop:1}}>{r.code} · {r.motivoLabel}</div>
+            </div>
+            <LogBadge status={r.status}/>
+          </div>
+          {r.desired&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Pretendido: {r.desired}</div>}
+          {r.note&&<div style={{fontSize:12,color:VI.muted,marginBottom:4}}>Obs: {r.note}</div>}
+          <div style={{fontSize:11,color:VI.muted,marginBottom:8}}>{r.storeName} · {r.sellerName} · {fmtShort(r.createdAt)} {fmtTime(r.createdAt)}</div>
+          {r.status==="DISTRIBUICAO"&&<div style={{fontSize:12,color:VI.carvao,marginBottom:8}}>Transferir de: <strong>{r.transferFromStore}</strong></div>}
+          {r.status==="COMPRA"&&<div style={{fontSize:12,color:VI.carvao,marginBottom:8}}>Fornecedor: <strong>{r.fornecedor}</strong></div>}
+          {(r.status==="RESOLVIDO"||r.status==="CANCELADO")&&<div style={{fontSize:11,color:VI.muted,marginBottom:8}}>Tratado por {r.handledBy||"—"} em {fmtShort(r.resolvedAt)}</div>}
+
+          {r.status==="PENDENTE"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <Btn variant="dark" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"distribuir")}><Icon name="store" size={12} color={VI.cream}/>Transferir</Btn>
+            <Btn variant="accent" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"comprar")}><Icon name="tag" size={12} color="#fff"/>Comprar</Btn>
+          </div>}
+          {(r.status==="DISTRIBUICAO"||r.status==="COMPRA")&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <Btn variant="success" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5}} disabled={!handledBy.trim()} onClick={()=>submitResolver(r.id)}><Icon name="check" size={12} color="#fff"/>Resolvido</Btn>
+            <Btn variant="ghost" style={{color:VI.red,borderColor:`${VI.red}55`}} disabled={!handledBy.trim()} onClick={()=>openAction(r.id,"cancelar")}>Cancelar</Btn>
+          </div>}
+          {!handledBy.trim()&&r.status!=="RESOLVIDO"&&r.status!=="CANCELADO"&&<div style={{fontSize:11,color:VI.muted,marginTop:6}}>Informe seu nome acima para tratar este pedido.</div>}
+        </div>
+      ))}
+    </div>
+
+    {actionModal?.kind==="distribuir"&&<Modal onClose={closeAction}>
+      <MIcon name="store"/>
+      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Transferir de outra loja</h2>
+      <Inp autoFocus value={transferFromStore} onChange={e=>setTransferFromStore(e.target.value)} placeholder="De qual loja vem a peça?*"/>
+      <Inp value={actionNote} onChange={e=>setActionNote(e.target.value)} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="accent" disabled={!transferFromStore.trim()||saving} onClick={submitDistribuicao}>{saving?"Salvando…":"Confirmar transferência"}</Btn></div>
+    </Modal>}
+
+    {actionModal?.kind==="comprar"&&<Modal onClose={closeAction}>
+      <MIcon name="tag"/>
+      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Enviar para compra</h2>
+      <Inp autoFocus value={fornecedor} onChange={e=>setFornecedor(e.target.value)} placeholder="Fornecedor*"/>
+      <Inp value={actionNote} onChange={e=>setActionNote(e.target.value)} placeholder="Observação (opcional)"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="accent" disabled={!fornecedor.trim()||saving} onClick={submitCompra}>{saving?"Salvando…":"Confirmar compra"}</Btn></div>
+    </Modal>}
+
+    {actionModal?.kind==="cancelar"&&<Modal onClose={closeAction}>
+      <MIcon name="x" color={VI.red} bg={VI.redBg}/>
+      <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Cancelar pedido</h2>
+      <Inp autoFocus value={actionNote} onChange={e=>setActionNote(e.target.value)} placeholder="Motivo do cancelamento"/>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Voltar</Btn><Btn variant="danger" disabled={saving} onClick={submitCancelar}>{saving?"Salvando…":"Confirmar cancelamento"}</Btn></div>
+    </Modal>}
   </AppShell>);
 }
 
