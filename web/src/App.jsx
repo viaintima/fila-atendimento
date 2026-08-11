@@ -288,6 +288,15 @@ const LOGISTICS_STATUS = {
   CANCELADO:    { label:"Cancelado",                color:VI.muted,  bg:VI.surfaceAlt },
 };
 const genLogisticsCode = () => `LOG-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).slice(2,4).toUpperCase()}`;
+// Lista fechada de fornecedores — a Logística escolhe entre eles (não digita
+// mais livremente), pra manter o nome padronizado e permitir agrupar/totalizar
+// os pedidos de compra por fornecedor no painel do Admin.
+const FORNECEDORES = [
+  "BELLA","BEST MANUFART","CONFECÇÕES ROSEMERI","DANKA CONFECÇÕES","DESIR ATELIER",
+  "DILADY","DULOREN","LAVAIMARIA","LIEBE LINGERIE","LOVE SECRET","LUA ENCANTADA",
+  "MALU PIJAMAS","MARIA CANDIDA","MENSAGEIRO DOS SONHOS","PLIÉ","PZAMA CONCECÇÕES LTDA",
+  "SELENE","SENSARE HOMEWEAR","VIA INTIMA","ZEE RUCCI",
+].sort((a,b)=>a.localeCompare(b,"pt-BR"));
 
 async function createLogisticsRequest({storeId,storeName,sellerName,originalServiceId=null,motivo,motivoLabel,reference,desired="",note="",createdBy}){
   const now=new Date().toISOString();
@@ -2164,17 +2173,26 @@ function AdminDashboard({onLogout}) {
     </>}
 
     {tab==="compras"&&(()=>{
-      // Agrupa por referência — a mesma peça pode ter sido pedida por mais de
-      // uma loja, e o Admin quer ver a lista de compra consolidada.
-      const groups={};
+      // Agrupa primeiro por fornecedor (visão principal do Admin: fechar um pedido
+      // consolidado por fornecedor) e, dentro de cada um, por referência — a mesma
+      // peça pode ter sido pedida por mais de uma loja. O Admin pode comprar tudo
+      // de um fornecedor de uma vez, comprar só uma referência, ou não fazer nada
+      // e deixar acumular até juntar um pedido maior.
+      const supplierMap={};
       comprasPendentes.forEach(r=>{
-        const key=`${r.reference}__${r.fornecedor||""}`;
-        if(!groups[key])groups[key]={reference:r.reference,fornecedor:r.fornecedor,items:[]};
-        groups[key].items.push(r);
+        const sKey=r.fornecedor||"Sem fornecedor";
+        if(!supplierMap[sKey])supplierMap[sKey]={fornecedor:sKey,items:[],refs:{}};
+        supplierMap[sKey].items.push(r);
+        const rKey=r.reference;
+        if(!supplierMap[sKey].refs[rKey])supplierMap[sKey].refs[rKey]={reference:rKey,items:[]};
+        supplierMap[sKey].refs[rKey].items.push(r);
       });
-      const allGrouped=Object.values(groups).sort((a,b)=>b.items.length-a.items.length);
-      const fornecedores=[...new Set(comprasPendentes.map(r=>r.fornecedor||"Sem fornecedor"))].sort((a,b)=>a.localeCompare(b));
-      const grouped=fornecedorFilter?allGrouped.filter(g=>(g.fornecedor||"Sem fornecedor")===fornecedorFilter):allGrouped;
+      const allSuppliers=Object.values(supplierMap)
+        .map(s=>({...s,refList:Object.values(s.refs).sort((a,b)=>b.items.length-a.items.length)}))
+        .sort((a,b)=>b.items.length-a.items.length);
+      const fornecedorNames=allSuppliers.map(s=>s.fornecedor).sort((a,b)=>a.localeCompare(b,"pt-BR"));
+      const suppliersShown=fornecedorFilter?allSuppliers.filter(s=>s.fornecedor===fornecedorFilter):allSuppliers;
+      const totalReferencias=new Set(comprasPendentes.map(r=>r.reference)).size;
       const resolved=logistics.filter(r=>r.status==="RESOLVIDO"||r.status==="CANCELADO").sort((a,b)=>new Date(b.resolvedAt)-new Date(a.resolvedAt));
 
       const markBought=async(ids)=>{
@@ -2190,9 +2208,9 @@ function AdminDashboard({onLogout}) {
 
       return(<div style={{padding:"18px 22px"}}>
         <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:18,marginBottom:14}}>
-          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Referências para comprar</div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:10,marginBottom:14}}>
-            {[{n:allGrouped.length,l:"Referências"},{n:comprasPendentes.length,l:"Pedidos em aberto"}].map((k,i)=>(
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Compras por fornecedor</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+            {[{n:allSuppliers.length,l:"Fornecedores"},{n:totalReferencias,l:"Referências"},{n:comprasPendentes.length,l:"Pedidos em aberto"}].map((k,i)=>(
               <div key={i} style={{textAlign:"center"}}>
                 <div style={{fontSize:22,fontWeight:700,color:VI.carvao,letterSpacing:"-0.02em",lineHeight:1}}>{k.n}</div>
                 <div style={{fontSize:10,color:VI.muted,textTransform:"uppercase",marginTop:4}}>{k.l}</div>
@@ -2203,42 +2221,58 @@ function AdminDashboard({onLogout}) {
           <Inp value={buyerName} onChange={e=>setBuyerName(e.target.value)} placeholder="Quem está comprando" style={{marginBottom:0}}/>
         </div>
 
-        {fornecedores.length>1&&<div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14}}>
+        {fornecedorNames.length>1&&<div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14}}>
           <button onClick={()=>setFornecedorFilter("")} style={{background:!fornecedorFilter?`${VI.terra}18`:"transparent",border:`1px solid ${!fornecedorFilter?VI.terra:VI.border}`,borderRadius:20,padding:"5px 12px",color:!fornecedorFilter?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:!fornecedorFilter?600:400}}>Todos os fornecedores</button>
-          {fornecedores.map(f=>(
+          {fornecedorNames.map(f=>(
             <button key={f} onClick={()=>setFornecedorFilter(f)} style={{background:fornecedorFilter===f?`${VI.terra}18`:"transparent",border:`1px solid ${fornecedorFilter===f?VI.terra:VI.border}`,borderRadius:20,padding:"5px 12px",color:fornecedorFilter===f?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:fornecedorFilter===f?600:400}}>{f}</button>
           ))}
         </div>}
 
-        {grouped.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="tag" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>{fornecedorFilter?"Nenhuma referência deste fornecedor.":"Nenhuma referência pendente de compra."}</p></div>}
+        {suppliersShown.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:VI.muted}}><Icon name="tag" size={32} color={VI.border} sw={1}/><p style={{marginTop:10}}>{fornecedorFilter?"Nenhum pedido deste fornecedor.":"Nenhuma referência pendente de compra."}</p></div>}
 
-        {grouped.map(g=>{const gKey=`${g.reference}__${g.fornecedor}`;const ids=g.items.map(it=>it.id);return(
-          <div key={gKey} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 16px",marginBottom:8}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontWeight:600,fontSize:15,color:VI.carvao}}>{g.reference}</div>
-                {editingFornecedor===gKey
-                  ?<div style={{display:"flex",gap:6,marginTop:6}}>
-                     <Inp autoFocus value={editFornecedorValue} onChange={e=>setEditFornecedorValue(e.target.value)} placeholder="Fornecedor" style={{marginBottom:0,flex:1}}/>
-                     <Btn variant="accent" style={{flexShrink:0}} disabled={!editFornecedorValue.trim()||!buyerName.trim()} onClick={()=>saveFornecedor(ids)}>Salvar</Btn>
-                     <Btn variant="ghost" style={{flexShrink:0}} onClick={()=>setEditingFornecedor(null)}>Cancelar</Btn>
-                   </div>
-                  :<div style={{fontSize:12,color:VI.muted,marginTop:2,display:"flex",alignItems:"center",gap:6}}>
-                     Fornecedor: <strong style={{color:VI.carvao}}>{g.fornecedor||"—"}</strong>
-                     <button onClick={()=>startEditFornecedor(gKey,g.fornecedor)} style={{background:"none",border:"none",cursor:"pointer",padding:2,display:"flex"}} title="Editar fornecedor"><Icon name="edit" size={11} color={VI.muted}/></button>
-                   </div>}
+        {suppliersShown.map(s=>{const supplierIds=s.items.map(it=>it.id);return(
+          <div key={s.fornecedor} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,paddingBottom:10,borderBottom:`1px solid ${VI.border}`}}>
+              <div style={{minWidth:0}}>
+                <div style={{fontWeight:700,fontSize:15,color:VI.carvao}}>{s.fornecedor}</div>
+                <div style={{fontSize:11,color:VI.muted,marginTop:2}}>{s.refList.length} referência{s.refList.length!==1?"s":""} · {s.items.length} pedido{s.items.length!==1?"s":""}</div>
               </div>
-              <span style={{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:5,background:VI.surfaceAlt,color:VI.muted,whiteSpace:"nowrap"}}>{g.items.length} pedido{g.items.length!==1?"s":""}</span>
+              <Btn variant="success" style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}} disabled={!buyerName.trim()} onClick={()=>markBought(supplierIds)}>
+                <Icon name="check" size={13} color="#fff"/>Comprar tudo
+              </Btn>
             </div>
-            {g.items.map(it=>(
-              <div key={it.id} style={{fontSize:12,color:VI.muted,borderTop:`1px solid ${VI.border}`,paddingTop:6,marginTop:6}}>
-                {it.storeName} · {it.sellerName}{it.desired?` · pretendido: ${it.desired}`:""} · {fmtShort(it.createdAt)}
+
+            {s.refList.map(g=>{const gKey=`${g.reference}__${s.fornecedor}`;const ids=g.items.map(it=>it.id);return(
+              <div key={gKey} style={{borderTop:`1px solid ${VI.border}`,paddingTop:10,marginTop:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:600,fontSize:14,color:VI.carvao}}>{g.reference}</div>
+                    {editingFornecedor===gKey&&<div style={{display:"flex",gap:6,marginTop:6}}>
+                      <select autoFocus value={editFornecedorValue} onChange={e=>setEditFornecedorValue(e.target.value)}
+                        style={{flex:1,background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"8px 10px",fontSize:13,fontFamily:"inherit",cursor:"pointer",color:editFornecedorValue?VI.carvao:VI.muted}}>
+                        <option value="">Selecione o fornecedor</option>
+                        {FORNECEDORES.map(f=><option key={f} value={f}>{f}</option>)}
+                      </select>
+                      <Btn variant="accent" style={{flexShrink:0}} disabled={!editFornecedorValue.trim()||!buyerName.trim()} onClick={()=>saveFornecedor(ids)}>Salvar</Btn>
+                      <Btn variant="ghost" style={{flexShrink:0}} onClick={()=>setEditingFornecedor(null)}>Cancelar</Btn>
+                    </div>}
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                    <span style={{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:5,background:VI.surfaceAlt,color:VI.muted,whiteSpace:"nowrap"}}>{g.items.length} pedido{g.items.length!==1?"s":""}</span>
+                    {editingFornecedor!==gKey&&<button onClick={()=>startEditFornecedor(gKey,s.fornecedor)} style={{background:"none",border:"none",cursor:"pointer",padding:2,display:"flex"}} title="Trocar fornecedor desta referência"><Icon name="edit" size={11} color={VI.muted}/></button>}
+                  </div>
+                </div>
+                {g.items.map(it=>(
+                  <div key={it.id} style={{fontSize:12,color:VI.muted,marginBottom:2}}>
+                    {it.storeName} · {it.sellerName}{it.desired?` · pretendido: ${it.desired}`:""} · {fmtShort(it.createdAt)}
+                  </div>
+                ))}
+                <Btn variant="ghost" style={{width:"100%",marginTop:8,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}
+                  disabled={!buyerName.trim()} onClick={()=>markBought(ids)}>
+                  <Icon name="check" size={13} color={VI.terra}/>Marcar esta referência como comprada
+                </Btn>
               </div>
-            ))}
-            <Btn variant="success" style={{width:"100%",marginTop:10,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}
-              disabled={!buyerName.trim()} onClick={()=>markBought(ids)}>
-              <Icon name="check" size={13} color="#fff"/>Marcar como comprado
-            </Btn>
+            );})}
           </div>
         );})}
 
@@ -2991,7 +3025,12 @@ function LogisticaDashboard({onLogout}){
     {actionModal?.kind==="comprar"&&<Modal onClose={closeAction}>
       <MIcon name="tag"/>
       <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:14}}>Enviar para compra</h2>
-      <Inp autoFocus value={fornecedor} onChange={e=>setFornecedor(e.target.value)} placeholder="Fornecedor*"/>
+      <div style={{fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"}}>Fornecedor</div>
+      <select autoFocus value={fornecedor} onChange={e=>setFornecedor(e.target.value)}
+        style={{display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:fornecedor?VI.carvao:VI.muted}}>
+        <option value="">Selecione o fornecedor*</option>
+        {FORNECEDORES.map(f=><option key={f} value={f}>{f}</option>)}
+      </select>
       <Inp value={actionNote} onChange={e=>setActionNote(e.target.value)} placeholder="Observação (opcional)"/>
       <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><Btn variant="ghost" onClick={closeAction}>Cancelar</Btn><Btn variant="accent" disabled={!fornecedor.trim()||saving} onClick={submitCompra}>{saving?"Salvando…":"Confirmar compra"}</Btn></div>
     </Modal>}
