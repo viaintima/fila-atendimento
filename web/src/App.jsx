@@ -870,13 +870,17 @@ function StoreApp({store,onLogout}) {
 
   // Semeia o checklist fixo assim que o dia começa (uma vez), com base no
   // horário real de abertura — integra o SLA das tarefas com a fila de vez.
+  // demands.length precisa estar nas dependências: sem isso, se a fila começar
+  // antes da lista de demandas terminar de carregar do banco (corrida comum ao
+  // abrir a loja), o efeito pode não "ver" a condição no momento certo e, como
+  // nada mais o aciona de novo depois, o checklist nunca é criado naquele dia.
   useEffect(()=>{
     if(session?.startedAt && demandsReady && demands.length===0){
       const seeded=seedDemandsFromOpening(session.startedAt,store.name);
       setDemands(seeded);
       setDoc(demandsRef(store.id),{items:seeded,updatedAt:serverTimestamp()});
     }
-  },[session?.startedAt,demandsReady]);
+  },[session?.startedAt,demandsReady,demands.length]);
 
   // Escalonamento automático: pendências vencidas passam para a
   // responsável e para a supervisão (spec v3, §4).
