@@ -2712,6 +2712,11 @@ function SupervisaoDashboard({onLogout}) {
   const [tplEdit,setTplEdit]=useState(null);      // rascunho no modal (novo ou existente)
   const [tplSaving,setTplSaving]=useState(false);
   const [tplDelete,setTplDelete]=useState(null);
+  const ymd=d=>d.toLocaleDateString("sv-SE"); // YYYY-MM-DD no fuso local
+  const [histories,setHistories]=useState({}); // dias encerrados por loja (para Acompanhamento/Pontuação)
+  const [histBusy,setHistBusy]=useState(false);
+  const [pFrom,setPFrom]=useState(()=>ymd(new Date(Date.now()-6*86400000)));
+  const [pTo,setPTo]=useState(()=>ymd(new Date()));
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
   useEffect(()=>{
@@ -2745,6 +2750,51 @@ function SupervisaoDashboard({onLogout}) {
       return stores.find(s=>s.id===prev.id)||prev;
     });
   },[stores]);
+
+  // Dias já encerrados (histórico) — necessários para Acompanhamento (lojas que
+  // já fecharam hoje) e Pontuação (qualquer período). Carrega ao abrir essas abas.
+  useEffect(()=>{
+    if((supTab!=="acomp"&&supTab!=="pontos")||stores.length===0)return;
+    let cancel=false;
+    (async()=>{
+      setHistBusy(true);
+      const data={};
+      for(const s of stores){
+        const snap=await getDocs(query(historyCol(s.id),orderBy("closedAt","desc")));
+        data[s.id]=snap.docs.map(d=>({id:d.id,...d.data()}));
+      }
+      if(!cancel){setHistories(data);setHistBusy(false);}
+    })();
+    return()=>{cancel=true;};
+  },[supTab,stores]);
+
+  const todayStr=ymd(now);
+  // Acompanhamento: tudo de hoje por loja — dia(s) já encerrado(s) + dia em andamento.
+  const dayBlocks=(sid)=>{
+    const blocks=[];
+    (histories[sid]||[]).filter(r=>r.startedAt&&ymd(new Date(r.startedAt))===todayStr)
+      .forEach(r=>blocks.push({key:r.id,label:`Dia encerrado às ${fmtTime(r.closedAt)}`,items:r.demands||[]}));
+    const live=demandsMap[sid]||[];
+    if(live.length>0)blocks.push({key:"live",label:"Dia em andamento",items:live});
+    return blocks;
+  };
+  // Pontuação no período escolhido: dias encerrados + dia atual, se dentro do intervalo.
+  const inPeriod=(iso)=>{const t=new Date(iso);return t>=new Date(pFrom+"T00:00:00")&&t<=new Date(pTo+"T23:59:59");};
+  const isDone=d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA";
+  const pontosRows=stores.map(s=>{
+    const lists=[];
+    (histories[s.id]||[]).forEach(r=>{if(r.startedAt&&inPeriod(r.startedAt))lists.push(r.demands||[]);});
+    const live=demandsMap[s.id]||[],liveStart=sessions[s.id]?.startedAt;
+    if(live.length&&liveStart&&inPeriod(liveStart))lists.push(live);
+    const all=lists.flat();
+    const sum=arr=>({n:arr.length,pts:arr.reduce((a,d)=>a+(d.pointsAwarded||0),0)});
+    return{
+      store:s,days:lists.length,
+      cells:templates.map(t=>sum(all.filter(d=>d.type!=="AVULSA"&&matchesTemplate(d,t)&&isDone(d)))),
+      avulsas:sum(all.filter(d=>d.type==="AVULSA"&&isDone(d))),
+      total:all.reduce((a,d)=>a+(d.pointsAwarded||0),0),
+    };
+  });
 
   const countsFor=(sid)=>{
     const items=demandsMap[sid]||[];
@@ -2913,16 +2963,28 @@ function SupervisaoDashboard({onLogout}) {
 
     {supTab==="acomp"&&<div style={{padding:"18px 22px 40px"}}>
       <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Acompanhamento por loja — hoje</div>
+      <p style={{fontSize:12,color:VI.muted,marginBottom:12,lineHeight:1.5}}>Todas as lojas ativas, abertas ou não, e todo o dia de hoje — inclusive lojas que já encerraram.</p>
       {stores.length===0&&<div style={{textAlign:"center",padding:"30px",color:VI.muted,fontSize:13}}>Nenhuma loja cadastrada.</div>}
       {stores.map(s=>{
-        const items=demandsMap[s.id]||[];
-        const c=countsFor(s.id);
+        const blocks=dayBlocks(s.id);
+        const all=blocks.flatMap(b=>b.items);
+        const done=all.filter(d=>d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA").length;
         return(<div key={s.id} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 15px",marginBottom:10}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
             <span style={{fontSize:14,fontWeight:600,color:VI.carvao}}>{s.name}</span>
-            <span style={{fontSize:11,color:VI.muted}}>{c.concluidas} concluída{c.concluidas!==1?"s":""} · {c.pendentes+c.atrasadas} em aberto</span>
+            <span style={{fontSize:11,color:VI.muted}}>{blocks.length===0?"Não abriu hoje":`${done} concluída${done!==1?"s":""} · ${all.length-done} em aberto`}</span>
           </div>
-          <TaskTrackTable items={items} now={now}/>
+          {blocks.length===0&&<div>
+            <div style={{fontSize:11,color:VI.muted,marginBottom:6}}>Loja ainda não iniciou o dia — tarefas previstas:</div>
+            {templates.map(t=><div key={t.id} style={{display:"flex",justifyContent:"space-between",gap:8,fontSize:12,padding:"6px 0",borderBottom:`1px solid ${VI.surfaceAlt}`}}>
+              <span style={{color:VI.carvao}}>{t.title}</span><span style={{color:VI.muted}}>{describeDeadline(t)}</span>
+            </div>)}
+          </div>}
+          {blocks.map(b=><div key={b.key} style={{marginTop:blocks.length>1?8:0}}>
+            {blocks.length>1&&<div style={{fontSize:10,fontWeight:600,textTransform:"uppercase",color:VI.muted,marginBottom:4}}>{b.label}</div>}
+            {blocks.length===1&&b.key!=="live"&&<div style={{fontSize:10,fontWeight:600,textTransform:"uppercase",color:VI.muted,marginBottom:4}}>{b.label}</div>}
+            <TaskTrackTable items={b.items} now={now}/>
+          </div>)}
         </div>);
       })}
     </div>}
@@ -2947,30 +3009,42 @@ function SupervisaoDashboard({onLogout}) {
         </div>
       </div>
 
-      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Pontos conquistados hoje, por loja</div>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Pontos conquistados por loja</div>
+      <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"12px 14px",marginBottom:10}}>
+        <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:10}}>
+          {[["Hoje",0],["7 dias",6],["30 dias",29]].map(([l,n])=>{
+            const f=ymd(new Date(Date.now()-n*86400000));
+            const active=pFrom===f&&pTo===todayStr;
+            return(<button key={l} onClick={()=>{setPFrom(f);setPTo(todayStr);}} style={{background:active?`${VI.terra}18`:"transparent",border:`1px solid ${active?VI.terra:VI.border}`,borderRadius:20,padding:"5px 12px",color:active?VI.terra:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:active?600:400}}>{l}</button>);
+          })}
+          <button onClick={()=>{const d=new Date();setPFrom(ymd(new Date(d.getFullYear(),d.getMonth(),1)));setPTo(todayStr);}} style={{background:"transparent",border:`1px solid ${VI.border}`,borderRadius:20,padding:"5px 12px",color:VI.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>Este mês</button>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div><div style={{fontSize:10,color:VI.muted,marginBottom:4,textTransform:"uppercase"}}>De</div>
+            <input type="date" value={pFrom} max={pTo} onChange={e=>setPFrom(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"9px 11px",color:VI.carvao,fontSize:13,fontFamily:"inherit",boxSizing:"border-box"}}/></div>
+          <div><div style={{fontSize:10,color:VI.muted,marginBottom:4,textTransform:"uppercase"}}>Até</div>
+            <input type="date" value={pTo} min={pFrom} onChange={e=>setPTo(e.target.value)} style={{width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:7,padding:"9px 11px",color:VI.carvao,fontSize:13,fontFamily:"inherit",boxSizing:"border-box"}}/></div>
+        </div>
+      </div>
       <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"6px 14px",overflowX:"auto"}}>
         <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
           <thead><tr>
             <th style={{textAlign:"left",padding:"8px 4px",fontSize:10,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`}}>Loja</th>
             {templates.map(t=><th key={t.id} style={{textAlign:"center",padding:"8px 4px",fontSize:9,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`,minWidth:54}}>{t.title}</th>)}
+            <th style={{textAlign:"center",padding:"8px 4px",fontSize:9,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`}}>Avulsas</th>
             <th style={{textAlign:"right",padding:"8px 4px",fontSize:10,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`}}>Total</th>
           </tr></thead>
           <tbody>
-            {stores.map(s=>{
-              const items=demandsMap[s.id]||[];
-              const total=items.reduce((a,d)=>a+(d.pointsAwarded||0),0);
-              return(<tr key={s.id}>
-                <td style={{padding:"8px 4px",fontWeight:600,color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{s.name}</td>
-                {templates.map(t=>{
-                  const d=items.find(x=>x.type!=="AVULSA"&&matchesTemplate(x,t));
-                  const done=d&&(d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA");
-                  return(<td key={t.id} style={{padding:"8px 4px",textAlign:"center",borderBottom:`1px solid ${VI.surfaceAlt}`,fontWeight:done?700:400,color:done?(d.status==="CONCLUIDA_NO_PRAZO"?VI.green:VI.yellow):VI.border}}>{done?d.pointsAwarded:"—"}</td>);
-                })}
-                <td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{total}</td>
-              </tr>);
-            })}
+            {pontosRows.map(r=>(<tr key={r.store.id}>
+              <td style={{padding:"8px 4px",fontWeight:600,color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{r.store.name}<div style={{fontSize:10,color:VI.muted,fontWeight:400}}>{r.days} dia{r.days!==1?"s":""}</div></td>
+              {r.cells.map((c,i)=>(<td key={i} style={{padding:"8px 4px",textAlign:"center",borderBottom:`1px solid ${VI.surfaceAlt}`,fontWeight:c.n?700:400,color:c.n?VI.green:VI.border}}>{c.n?c.pts:"—"}{c.n>1&&<div style={{fontSize:9,color:VI.muted,fontWeight:400}}>{c.n}×</div>}</td>))}
+              <td style={{padding:"8px 4px",textAlign:"center",borderBottom:`1px solid ${VI.surfaceAlt}`,color:r.avulsas.n?VI.green:VI.border,fontWeight:r.avulsas.n?700:400}}>{r.avulsas.n?r.avulsas.pts:"—"}</td>
+              <td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{r.total}</td>
+            </tr>))}
+            <tr><td style={{padding:"8px 4px",fontWeight:700,color:VI.carvao}}>Total</td><td colSpan={templates.length+1}/><td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.terra}}>{pontosRows.reduce((a,r)=>a+r.total,0)}</td></tr>
           </tbody>
         </table>
+        {histBusy&&<div style={{fontSize:11,color:VI.muted,padding:"6px 0"}}>Carregando histórico…</div>}
       </div>
     </div>}
 
@@ -3502,94 +3576,4 @@ ${demands.length>0?`<div class="sec nb"><div class="sec-t">Tarefas do Dia</div>
   <div class="kp am"><div class="kn">${tPoints}</div><div class="kl">Pontos</div></div>
 </div>
 ${sortedTaskPoints.length>0?`<table style="margin-top:14px"><thead><tr><th>Funcionária</th><th class="tc">Tarefas</th><th class="tc">Pontos</th></tr></thead>
-<tbody>${sortedTaskPoints.map(p=>`<tr><td class="tn">${p.name}</td><td class="tc">${p.tasks}</td><td class="tc tg">${p.points}</td></tr>`).join("")}</tbody></table>`:""}
-</div>`:""}
-
-${services.length>0?`<div class="sec nb"><div class="sec-t">Movimento por Hora</div>
-<div class="hcont">${hD.map(([h,c])=>{const ip=parseInt(h)===parseInt(pk?.[0])&&c>0;const bh=mH>0?Math.max((c/mH)*64,c>0?3:0):0;return`<div class="hcol"><div class="hv" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div style="flex:1;display:flex;align-items:flex-end;width:100%"><div class="hbar" style="height:${bh}px;background:${ip?"#B5706A":c>0?"#F2B5C0":"#EDD9D3"}"></div></div><div class="hl" style="color:${ip?"#B5706A":"#9E7E78"}">${h}h</div></div>`;}).join("")}</div>
-</div>`:""}
-
-<div class="sec nb"><div class="sec-t">Motivos de Não Venda</div>
-${sR.length===0?'<p style="color:#9E7E78;font-size:13px">Todos os atendimentos resultaram em venda.</p>'
-:sR.map(([l,c])=>`<div class="rb"><div class="rn">${l}</div><div class="rt"><div class="rf" style="width:${Math.round((c/mR)*100)}%"></div></div><div class="rq">${c}</div><div class="rp">${nS.length?Math.round((c/nS.length)*100):0}%</div></div>`).join("")}
-</div>
-
-<div class="sec"><div class="sec-t">Histórico — ${services.length} registro${services.length!==1?"s":""}</div>
-${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
-:services.map(s=>`<div class="hi"><span class="ht">${fmtTime(s.startTime)}</span><span class="hname">${s.salespersonName}</span><span class="hout" style="color:${s.isSale?"#2D7A4F":"#B83232"}">${s.outcomeLabel}</span></div>`).join("")}
-</div>
-
-<div class="ft"><span>Via Íntima · ${storeName} · ${gD}</span><span>Sistema de Atendimento · ${gT}</span></div>
-</div></body></html>`;
-
-  const w=window.open("","_blank");
-  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
-}
-
-function exportPontoPDF(storeName,personName,from,to,days,totalWorkedMin){
-  const gT=new Date().toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
-  const fD=d=>d.toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric"});
-  const wH=(m)=>Math.floor(m/60)>0?`${Math.floor(m/60)}h ${m%60}m`:`${m}m`;
-  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Folha de Ponto — ${personName}</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'DM Sans',sans-serif;color:#2C2020;font-size:13px;line-height:1.5;background:#fff}
-.pg{max-width:860px;margin:0 auto;padding:48px}
-.rh{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:18px;border-bottom:2px solid #F2B5C0;margin-bottom:28px}
-.brand{font-family:Georgia,serif;font-size:12px;font-weight:300;color:#B5706A;letter-spacing:.12em;text-transform:uppercase;margin-bottom:3px}
-.rh h1{font-size:21px;font-weight:600;letter-spacing:-.01em}
-.meta{text-align:right;color:#9E7E78;font-size:12px;line-height:1.8}
-.meta strong{color:#2C2020;font-size:14px;display:block;font-weight:600}
-.sec{margin-bottom:26px}
-.sec-t{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:#9E7E78;margin-bottom:11px;padding-bottom:6px;border-bottom:1px solid #EDD9D3}
-.k2{display:grid;grid-template-columns:repeat(2,1fr);gap:11px}
-.kp{border:1px solid #EDD9D3;border-radius:10px;padding:14px;background:#FDF0EC;text-align:center}
-.kn{font-size:26px;font-weight:700;color:#2C2020;letter-spacing:-.03em;line-height:1}
-.kl{font-size:10px;color:#9E7E78;margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
-table{width:100%;border-collapse:collapse}
-thead th{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#9E7E78;padding:7px 9px;text-align:left;border-bottom:1px solid #EDD9D3}
-tbody td{padding:8px 9px;border-bottom:1px solid #F5EDE8;vertical-align:middle}
-tbody tr:last-child td{border-bottom:none}
-.tn{font-weight:500;color:#2C2020;text-transform:capitalize}.tg{color:#2D7A4F;font-weight:600}.td{color:#9E7E78;font-size:11px}.tc{text-align:center}
-.ft{margin-top:36px;padding-top:12px;border-top:1px solid #EDD9D3;display:flex;justify-content:space-between;color:#9E7E78;font-size:11px}
-.sign{margin-top:56px;display:flex;justify-content:space-between;gap:40px}
-.sign div{flex:1;border-top:1px solid #2C2020;padding-top:6px;text-align:center;font-size:11px;color:#9E7E78}
-@media print{.pg{padding:28px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-</style></head><body><div class="pg">
-
-<div class="rh">
-  <div><div class="brand">Via Íntima</div><h1>Folha de Ponto</h1></div>
-  <div class="meta"><strong>${personName}</strong>${storeName}<br>${fD(from)} – ${fD(to)}</div>
-</div>
-
-<div class="sec nb"><div class="sec-t">Resumo do Período</div>
-<div class="k2">
-  <div class="kp"><div class="kn">${days.length}</div><div class="kl">Dias registrados</div></div>
-  <div class="kp"><div class="kn">${wH(totalWorkedMin)}</div><div class="kl">Total de horas</div></div>
-</div>
-</div>
-
-<div class="sec"><div class="sec-t">Registros diários</div>
-<table><thead><tr><th>Data</th><th>Entrada</th><th>Pausas</th><th>Saída</th><th class="tc">Horas</th></tr></thead>
-<tbody>${days.length===0?'<tr><td colspan="5" style="color:#9E7E78;padding:14px 9px">Nenhum registro no período.</td></tr>':days.slice().sort((a,b)=>new Date(a.date)-new Date(b.date)).map(d=>`<tr>
-  <td class="tn">${fmtShort(d.date)}</td>
-  <td class="td">${fmtTime(d.entryTime)}</td>
-  <td class="td">${d.breaks.length===0?"—":d.breaks.map(b=>`${fmtTime(b.start)}–${b.end?fmtTime(b.end):"…"}`).join(", ")}</td>
-  <td class="td">${d.exitTime?fmtTime(d.exitTime):"—"}</td>
-  <td class="tc tg">${wH(d.workedMin)}</td>
-</tr>`).join("")}</tbody></table>
-</div>
-
-<div class="sign">
-  <div>${personName}</div>
-  <div>Supervisão / Administração</div>
-</div>
-
-<div class="ft"><span>Via Íntima · ${storeName} · ${fD(from)} – ${fD(to)}</span><span>Folha de Ponto · gerado às ${gT}</span></div>
-</div></body></html>`;
-
-  const w=window.open("","_blank");
-  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
-}
+<tbody>${sortedTaskPoints.map(p=>`<tr><td class="tn">${p.name}</td><
