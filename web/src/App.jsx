@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   doc, collection, onSnapshot, setDoc, getDoc,
-  getDocs, serverTimestamp, query, orderBy, where,
+  getDocs, serverTimestamp, query, orderBy, where, deleteDoc,
 } from "firebase/firestore";
 import { db } from "./firebase.js";
 
@@ -412,21 +412,72 @@ const fmtElapsed = (sinceAt,now) => `solicitada há ${Math.max(0,Math.round((now
 // Tudo o mais (vitrine, seção, limpeza pontual etc.) é demanda avulsa
 // criada pela Supervisão em SupervisaoDashboard. Nenhuma tarefa passa por
 // aprovação — a loja marca como realizada e ela fecha na hora.
-function seedDemandsFromOpening(openingIso,storeName){
-  const min=60000, opening=new Date(openingIso).getTime();
-  const closingHour=getClosingHour(storeName);
-  const dayRef=new Date(openingIso);
-  const at=(h,m=0)=>{const d=new Date(dayRef);d.setHours(h,m,0,0);return d.toISOString();};
-  const beforeClose=(mins)=>new Date(new Date(at(closingHour,0)).getTime()-mins*min).toISOString();
+//
+// As tarefas fixas agora são cadastradas pela Supervisão (doc config/tarefasFixas),
+// iguais para todas as lojas. DEFAULT_FIXED_TASKS reproduz o checklist original e
+// vale enquanto a Supervisão ainda não salvou uma lista própria.
+// Prazo (deadline): "clock" = hora fixa do dia; "afterOpen" = N min após a abertura;
+// "beforeClose" = N min antes do fechamento da loja (escala em STORE_CLOSING_HOUR).
+const fixedTasksRef = () => doc(db,"config","tarefasFixas");
+const DEFAULT_FIXED_TASKS = [
+  { id:"CAIXA_ABERTURA",     type:"ABERTURA",   title:"Conferência do Caixa", description:"Fundo de caixa contado e registrado na abertura.",  points:TASK_POINTS.CAIXA_ABERTURA,     mode:"afterOpen",   minutes:ABERTURA_SLA_MIN.CAIXA,        clock:"" },
+  { id:"DIARIA",             type:"ABERTURA",   title:"Diária",               description:"Conferir/preencher a planilha de diária.",          points:TASK_POINTS.DIARIA,             mode:"afterOpen",   minutes:ABERTURA_SLA_MIN.DIARIA,       clock:"" },
+  { id:"LIMPEZA_ABERTURA",   type:"ABERTURA",   title:"Limpeza de Loja",      description:"Piso, vitrine e provadores limpos antes da abertura.", points:TASK_POINTS.LIMPEZA_ABERTURA, mode:"afterOpen",   minutes:ABERTURA_SLA_MIN.LIMPEZA,      clock:"" },
+  { id:"PARCIAL",            type:"FECHAMENTO", title:"Envio da Parcial",     description:"Enviar o parcial do dia para a Supervisão até 16h (tolerância até 16h30).", points:TASK_POINTS.PARCIAL, mode:"clock", minutes:0, clock:"16:30" },
+  { id:"LIMPEZA_FECHAMENTO", type:"FECHAMENTO", title:"Limpeza de Loja",      description:"Limpeza geral da loja antes do fechamento.",        points:TASK_POINTS.LIMPEZA_FECHAMENTO, mode:"beforeClose", minutes:FECHAMENTO_LEAD_MIN.LIMPEZA,   clock:"" },
+  { id:"CAIXA_FECHAMENTO",   type:"FECHAMENTO", title:"Fechamento de Caixa",  description:"Fundo de caixa contado e registrado no fechamento.", points:TASK_POINTS.CAIXA_FECHAMENTO,   mode:"beforeClose", minutes:FECHAMENTO_LEAD_MIN.CAIXA,     clock:"" },
+];
+const DEADLINE_MODES = {
+  clock:       "Hora fixa do dia",
+  afterOpen:   "Minutos após a abertura",
+  beforeClose: "Minutos antes do fechamento",
+};
+const describeDeadline = (t) => t.mode==="clock" ? `até ${t.clock||"—"}` : t.mode==="afterOpen" ? `${t.minutes} min após a abertura` : `${t.minutes} min antes do fechamento`;
+
+function computeFixedDueAt(tpl,openingIso,storeName){
+  const min=60000, dayRef=new Date(openingIso);
+  const at=(h,m=0)=>{const d=new Date(dayRef);d.setHours(h,m,0,0);return d;};
+  if(tpl.mode==="clock"){
+    const [h,m]=(tpl.clock||"00:00").split(":").map(Number);
+    return at(h||0,m||0).toISOString();
+  }
+  if(tpl.mode==="beforeClose") return new Date(at(getClosingHour(storeName),0).getTime()-(Number(tpl.minutes)||0)*min).toISOString();
+  return new Date(dayRef.getTime()+(Number(tpl.minutes)||0)*min).toISOString();
+}
+
+// Casa uma demanda do dia com o cadastro: itens novos usam templateId; os
+// semeados antes desta mudança usam code (= id das tarefas padrão).
+const matchesTemplate = (d,tpl) => d.templateId===tpl.id || (!d.templateId && d.code===tpl.id);
+
+// Sincroniza o checklist de UMA loja com o cadastro central. Devolve a nova lista
+// ou null se nada mudou (evita regravar à toa). Regras:
+// - tarefa cadastrada e ausente no dia → criada (também cobre tarefa adicionada com o dia em andamento);
+// - tarefa ainda em aberto → título/descrição/pontos/prazo acompanham o cadastro;
+// - tarefa removida do cadastro e ainda em aberto → some; as já concluídas ficam no histórico;
+// - o registro de conclusão é da loja (doc demands/{loja}); nunca é tocado aqui.
+function syncFixedDemands(demands,openingIso,storeName,templates,now=new Date()){
+  const OPEN=["PENDENTE","ATRASADA","ESCALADA"];
+  let changed=false;
+  const next=[];
+  demands.forEach(d=>{
+    if(d.type==="AVULSA"){next.push(d);return;}
+    const tpl=templates.find(t=>matchesTemplate(d,t));
+    if(!tpl){ if(OPEN.includes(d.status)){changed=true;return;} next.push(d);return; }
+    if(!OPEN.includes(d.status)){next.push(d);return;}
+    const dueAt=computeFixedDueAt(tpl,openingIso,storeName);
+    const upd={title:tpl.title,description:tpl.description,points:Number(tpl.points)||0,type:tpl.type,dueAt,templateId:tpl.id,code:tpl.id};
+    const diff=Object.keys(upd).some(k=>d[k]!==upd[k]);
+    if(!diff){next.push(d);return;}
+    changed=true;
+    next.push({...d,...upd,status:new Date(dueAt)>now?"PENDENTE":d.status});
+  });
   const blank={assignedTo:null,sentBy:null,note:"",pointsAwarded:0,completedBy:null,status:"PENDENTE",createdAt:openingIso,completedAt:null};
-  return [
-    { id:uid(), code:"CAIXA_ABERTURA",     type:"ABERTURA",   title:"Conferência do Caixa",  description:"Fundo de caixa contado e registrado na abertura.",                points:TASK_POINTS.CAIXA_ABERTURA,     dueAt:new Date(opening+ABERTURA_SLA_MIN.CAIXA*min).toISOString(),   ...blank },
-    { id:uid(), code:"DIARIA",             type:"ABERTURA",   title:"Diária",                description:"Conferir/preencher a planilha de diária.",                        points:TASK_POINTS.DIARIA,             dueAt:new Date(opening+ABERTURA_SLA_MIN.DIARIA*min).toISOString(),  ...blank },
-    { id:uid(), code:"LIMPEZA_ABERTURA",   type:"ABERTURA",   title:"Limpeza de Loja",       description:"Piso, vitrine e provadores limpos antes da abertura.",            points:TASK_POINTS.LIMPEZA_ABERTURA,   dueAt:new Date(opening+ABERTURA_SLA_MIN.LIMPEZA*min).toISOString(), ...blank },
-    { id:uid(), code:"PARCIAL",            type:"FECHAMENTO", title:"Envio da Parcial",      description:"Enviar o parcial do dia para a Supervisão até 16h (tolerância até 16h30).", points:TASK_POINTS.PARCIAL, dueAt:at(16,30), ...blank },
-    { id:uid(), code:"LIMPEZA_FECHAMENTO", type:"FECHAMENTO", title:"Limpeza de Loja",       description:"Limpeza geral da loja antes do fechamento.",                      points:TASK_POINTS.LIMPEZA_FECHAMENTO, dueAt:beforeClose(FECHAMENTO_LEAD_MIN.LIMPEZA), ...blank },
-    { id:uid(), code:"CAIXA_FECHAMENTO",   type:"FECHAMENTO", title:"Fechamento de Caixa",   description:"Fundo de caixa contado e registrado no fechamento.",              points:TASK_POINTS.CAIXA_FECHAMENTO,   dueAt:beforeClose(FECHAMENTO_LEAD_MIN.CAIXA),   ...blank },
-  ];
+  templates.forEach(tpl=>{
+    if(next.some(d=>d.type!=="AVULSA"&&matchesTemplate(d,tpl)))return;
+    changed=true;
+    next.push({id:`fixa_${tpl.id}`,templateId:tpl.id,code:tpl.id,type:tpl.type,title:tpl.title,description:tpl.description,points:Number(tpl.points)||0,dueAt:computeFixedDueAt(tpl,openingIso,storeName),...blank});
+  });
+  return changed?next:null;
 }
 
 const Icon = ({ name, size=16, color="currentColor", sw=1.5 }) => {
@@ -800,6 +851,8 @@ function StoreApp({store,onLogout}) {
   const [ready,setReady]=useState(false);
   const [demands,setDemands]=useState([]);
   const [demandsReady,setDemandsReady]=useState(false);
+  const [fixedTpl,setFixedTpl]=useState(DEFAULT_FIXED_TASKS);
+  const [tplReady,setTplReady]=useState(false);
   const [activeTask,setActiveTask]=useState(null);
   const [taskNote,setTaskNote]=useState("");
   const [taskWho,setTaskWho]=useState("");
@@ -868,19 +921,29 @@ function StoreApp({store,onLogout}) {
     setSession(null);setQueue([]);setServices([]);setConfClose(false);setView("queue");setCurSvc(null);setDemands([]);
   };
 
-  // Semeia o checklist fixo assim que o dia começa (uma vez), com base no
-  // horário real de abertura — integra o SLA das tarefas com a fila de vez.
-  // demands.length precisa estar nas dependências: sem isso, se a fila começar
-  // antes da lista de demandas terminar de carregar do banco (corrida comum ao
-  // abrir a loja), o efeito pode não "ver" a condição no momento certo e, como
-  // nada mais o aciona de novo depois, o checklist nunca é criado naquele dia.
+  // Cadastro central das tarefas fixas (definido pela Supervisão, igual para todas
+  // as lojas). Sem cadastro salvo, vale o checklist padrão.
   useEffect(()=>{
-    if(session?.startedAt && demandsReady && demands.length===0){
-      const seeded=seedDemandsFromOpening(session.startedAt,store.name);
-      setDemands(seeded);
-      setDoc(demandsRef(store.id),{items:seeded,updatedAt:serverTimestamp()});
+    const u=onSnapshot(fixedTasksRef(),snap=>{
+      const items=snap.exists()&&Array.isArray(snap.data().items)?snap.data().items:DEFAULT_FIXED_TASKS;
+      setFixedTpl(items);setTplReady(true);
+    });
+    return()=>u();
+  },[]);
+
+  // Mantém o checklist fixo do dia em sincronia com o cadastro: cria as tarefas
+  // assim que o dia começa e acompanha inclusões/edições/remoções feitas pela
+  // Supervisão no meio do dia. A conclusão fica no doc desta loja, então o que uma
+  // loja marca nunca altera as demais. As dependências incluem demands/fixedTpl
+  // para o efeito sempre reavaliar (corrida entre fila e carga das demandas).
+  useEffect(()=>{
+    if(!session?.startedAt||!demandsReady||!tplReady)return;
+    const synced=syncFixedDemands(demands,session.startedAt,store.name,fixedTpl,new Date());
+    if(synced){
+      setDemands(synced);
+      setDoc(demandsRef(store.id),{items:synced,updatedAt:serverTimestamp()});
     }
-  },[session?.startedAt,demandsReady,demands.length]);
+  },[session?.startedAt,demandsReady,tplReady,demands,fixedTpl]);
 
   // Escalonamento automático: pendências vencidas passam para a
   // responsável e para a supervisão (spec v3, §4).
@@ -2643,8 +2706,21 @@ function SupervisaoDashboard({onLogout}) {
   const [assignTo,setAssignTo]=useState("");
   const [saving,setSaving]=useState(false);
   const [reservations,setReservations]=useState([]);
+  const [supTab,setSupTab]=useState("painel"); // painel | fixas | acomp | pontos
+  const [templates,setTemplates]=useState(DEFAULT_FIXED_TASKS);
+  const [tplCustom,setTplCustom]=useState(false); // false = ainda usando o padrão do app
+  const [tplEdit,setTplEdit]=useState(null);      // rascunho no modal (novo ou existente)
+  const [tplSaving,setTplSaving]=useState(false);
+  const [tplDelete,setTplDelete]=useState(null);
 
   useEffect(()=>{const t=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(t);},[]);
+  useEffect(()=>{
+    const u=onSnapshot(fixedTasksRef(),snap=>{
+      const has=snap.exists()&&Array.isArray(snap.data().items);
+      setTemplates(has?snap.data().items:DEFAULT_FIXED_TASKS);setTplCustom(has);
+    });
+    return()=>u();
+  },[]);
   useEffect(()=>{const u=onSnapshot(collection(db,"stores"),snap=>{setStores(snap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>s.active!==false).sort((a,b)=>a.name.localeCompare(b.name)));});return()=>u();},[]);
   useEffect(()=>{const u=onSnapshot(reservationsCol(),snap=>{setReservations(snap.docs.map(d=>d.data()));});return()=>u();},[]);
   useEffect(()=>{
@@ -2724,6 +2800,20 @@ function SupervisaoDashboard({onLogout}) {
     setSaving(false);setShowNew(false);
   };
 
+  // Cadastro central das tarefas fixas (iguais para todas as lojas).
+  const saveTemplates=async(list)=>{await setDoc(fixedTasksRef(),{items:list,updatedAt:serverTimestamp()});};
+  const newTpl=()=>setTplEdit({id:null,type:"ABERTURA",title:"",description:"",points:TASK_POINTS.AVULSA,mode:"clock",minutes:30,clock:"10:00"});
+  const submitTpl=async()=>{
+    const d=tplEdit;if(!d||!d.title.trim())return;
+    setTplSaving(true);
+    const item={id:d.id||`T_${uid()}`,type:d.type,title:d.title.trim(),description:(d.description||"").trim(),points:Number(d.points)||0,mode:d.mode,minutes:Number(d.minutes)||0,clock:d.clock||""};
+    const list=d.id?templates.map(t=>t.id===d.id?item:t):[...templates,item];
+    await saveTemplates(list);
+    setTplSaving(false);setTplEdit(null);
+  };
+  const removeTpl=async(id)=>{await saveTemplates(templates.filter(t=>t.id!==id));setTplDelete(null);};
+  const resetTpl=async()=>{await deleteDoc(fixedTasksRef());};
+
   if(detailStore){
     const items=demandsMap[detailStore.id]||[];
     const groups={
@@ -2741,6 +2831,10 @@ function SupervisaoDashboard({onLogout}) {
         </>}/>
       <StatsRow items={[{num:q.svc,label:"Atendimentos"},{num:q.sales,label:"Vendas",color:VI.green},{num:`${q.conv}%`,label:"Conversão"},{num:q.active,label:"Em turno"}]}/>
       <div style={{padding:"14px 22px 0"}}>
+        <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 15px",marginBottom:18}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:8}}>Acompanhamento das tarefas — limite × conclusão</div>
+          <TaskTrackTable items={items} now={now}/>
+        </div>
         {groups.atrasadas.length>0&&<TaskSection title="Atrasadas" items={groups.atrasadas} now={now}/>}
         <TaskSection title="Pendentes" items={groups.pendentes} now={now} empty="Nenhuma tarefa pendente"/>
         {groups.concluidas.length>0&&<TaskSection title="Concluídas hoje" items={groups.concluidas} now={now} dim/>}
@@ -2767,6 +2861,120 @@ function SupervisaoDashboard({onLogout}) {
         <Btn variant="ghost" style={{padding:"9px 10px",display:"flex",alignItems:"center"}} onClick={onLogout}><Icon name="logout" size={13} color={VI.muted}/></Btn>
       </>}/>
 
+    <div style={{display:"flex",gap:6,padding:"10px 22px",borderBottom:`1px solid ${VI.border}`,background:VI.surface,overflowX:"auto"}}>
+      {SUP_TABS.map(t=>{
+        const active=supTab===t.id;
+        return(<button key={t.id} onClick={()=>setSupTab(t.id)}
+          style={{display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:8,flex:1,justifyContent:"center",
+                  border:`1px solid ${active?VI.terra:VI.border}`,background:active?`${VI.terra}12`:"transparent",
+                  color:active?VI.terra:VI.muted,fontSize:12,fontWeight:active?600:500,
+                  cursor:"pointer",fontFamily:"inherit",flexShrink:0,whiteSpace:"nowrap"}}>
+          <Icon name={t.icon} size={13} color={active?VI.terra:VI.muted}/>{t.label}
+        </button>);
+      })}
+    </div>
+
+    {supTab==="fixas"&&<div style={{padding:"18px 22px 40px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:6}}>
+        <span style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted}}>Tarefas fixas — todas as lojas</span>
+        <Btn variant="accent" style={{display:"flex",alignItems:"center",gap:5}} onClick={newTpl}><Icon name="plus" size={13} color="#fff"/>Nova tarefa fixa</Btn>
+      </div>
+      <p style={{fontSize:12,color:VI.muted,marginBottom:14,lineHeight:1.5}}>
+        Estas tarefas aparecem automaticamente na aba Tarefas de cada loja, com o horário limite abaixo. Alterações valem para as tarefas ainda em aberto hoje e para os próximos dias; o que já foi concluído não muda.
+        {!tplCustom&&" Hoje o app está usando o checklist padrão — ao salvar qualquer alteração, a lista passa a ser a sua."}
+      </p>
+      {templates.length===0&&<div style={{textAlign:"center",padding:"30px 20px",color:VI.muted,fontSize:13}}>Nenhuma tarefa fixa cadastrada. As lojas ficam só com as demandas avulsas.</div>}
+      {templates.map(t=>{
+        const meta=DEMAND_TYPES[t.type]||DEMAND_TYPES.ABERTURA;
+        return(<div key={t.id} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:10,display:"flex",overflow:"hidden",marginBottom:7}}>
+          <div style={{width:3,flexShrink:0,background:meta.color}}/>
+          <div style={{flex:1,padding:"11px 13px",minWidth:0}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+              <div style={{minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:600,color:VI.carvao}}>{t.title}</div>
+                <div style={{fontSize:11,color:VI.muted,marginTop:2}}>{meta.label} · {describeDeadline(t)} · {t.points} pts</div>
+                {t.description&&<div style={{fontSize:12,color:VI.muted,marginTop:4}}>{t.description}</div>}
+              </div>
+              <div style={{display:"flex",gap:4,flexShrink:0}}>
+                <button onClick={()=>setTplEdit({...t})} title="Editar" style={{background:"none",border:"none",cursor:"pointer",padding:5,display:"flex"}}><Icon name="edit" size={14} color={VI.muted}/></button>
+                <button onClick={()=>setTplDelete(t.id)} title="Remover" style={{background:"none",border:"none",cursor:"pointer",padding:5,display:"flex"}}><Icon name="x" size={14} color={VI.red}/></button>
+              </div>
+            </div>
+            {tplDelete===t.id&&<div style={{display:"flex",alignItems:"center",gap:8,marginTop:9,paddingTop:9,borderTop:`1px solid ${VI.border}`}}>
+              <span style={{fontSize:12,color:VI.carvao,flex:1}}>Remover das lojas? (as já concluídas ficam no histórico)</span>
+              <Btn variant="ghost" onClick={()=>setTplDelete(null)}>Não</Btn>
+              <Btn variant="danger" onClick={()=>removeTpl(t.id)}>Remover</Btn>
+            </div>}
+          </div>
+        </div>);
+      })}
+      {tplCustom&&<Btn variant="sm" style={{marginTop:8}} onClick={resetTpl}>Restaurar checklist padrão</Btn>}
+    </div>}
+
+    {supTab==="acomp"&&<div style={{padding:"18px 22px 40px"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Acompanhamento por loja — hoje</div>
+      {stores.length===0&&<div style={{textAlign:"center",padding:"30px",color:VI.muted,fontSize:13}}>Nenhuma loja cadastrada.</div>}
+      {stores.map(s=>{
+        const items=demandsMap[s.id]||[];
+        const c=countsFor(s.id);
+        return(<div key={s.id} style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"13px 15px",marginBottom:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <span style={{fontSize:14,fontWeight:600,color:VI.carvao}}>{s.name}</span>
+            <span style={{fontSize:11,color:VI.muted}}>{c.concluidas} concluída{c.concluidas!==1?"s":""} · {c.pendentes+c.atrasadas} em aberto</span>
+          </div>
+          <TaskTrackTable items={items} now={now}/>
+        </div>);
+      })}
+    </div>}
+
+    {supTab==="pontos"&&<div style={{padding:"18px 22px 40px"}}>
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Tabela de pontuação das tarefas</div>
+      <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"6px 14px",marginBottom:14,overflowX:"auto"}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+          <thead><tr>{["Tarefa","Limite","No prazo","Atrasada"].map((h,i)=><th key={h} style={{textAlign:i>1?"right":"left",padding:"8px 4px",fontSize:10,textTransform:"uppercase",letterSpacing:"0.05em",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`}}>{h}</th>)}</tr></thead>
+          <tbody>
+            {templates.map(t=>(<tr key={t.id}>
+              <td style={{padding:"8px 4px",color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{t.title}<div style={{fontSize:10,color:VI.muted}}>{(DEMAND_TYPES[t.type]||DEMAND_TYPES.ABERTURA).label}</div></td>
+              <td style={{padding:"8px 4px",color:VI.muted,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{describeDeadline(t)}</td>
+              <td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.green,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{t.points}</td>
+              <td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.yellow,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{Math.round((Number(t.points)||0)*TASK_SCORE.LATE_RATIO)}</td>
+            </tr>))}
+            <tr><td style={{padding:"8px 4px",color:VI.carvao}}>Demanda avulsa<div style={{fontSize:10,color:VI.muted}}>prazo definido na criação</div></td><td style={{padding:"8px 4px",color:VI.muted}}>—</td><td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.green}}>{TASK_POINTS.AVULSA}</td><td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.yellow}}>{Math.round(TASK_POINTS.AVULSA*TASK_SCORE.LATE_RATIO)}</td></tr>
+          </tbody>
+        </table>
+        <div style={{fontSize:11,color:VI.muted,padding:"10px 0 8px",lineHeight:1.6}}>
+          Atraso paga {Math.round(TASK_SCORE.LATE_RATIO*100)}% do valor. Observação preenchida: +{TASK_SCORE.QUALITY_BONUS} pts. Todas as tarefas de Abertura (ou de Fechamento) no prazo: +{TASK_SCORE.PERFECT} pts de bônus, uma vez por grupo.
+        </div>
+      </div>
+
+      <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:VI.muted,marginBottom:10}}>Pontos conquistados hoje, por loja</div>
+      <div style={{background:VI.surface,border:`1px solid ${VI.border}`,borderRadius:12,padding:"6px 14px",overflowX:"auto"}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+          <thead><tr>
+            <th style={{textAlign:"left",padding:"8px 4px",fontSize:10,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`}}>Loja</th>
+            {templates.map(t=><th key={t.id} style={{textAlign:"center",padding:"8px 4px",fontSize:9,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`,minWidth:54}}>{t.title}</th>)}
+            <th style={{textAlign:"right",padding:"8px 4px",fontSize:10,textTransform:"uppercase",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`}}>Total</th>
+          </tr></thead>
+          <tbody>
+            {stores.map(s=>{
+              const items=demandsMap[s.id]||[];
+              const total=items.reduce((a,d)=>a+(d.pointsAwarded||0),0);
+              return(<tr key={s.id}>
+                <td style={{padding:"8px 4px",fontWeight:600,color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{s.name}</td>
+                {templates.map(t=>{
+                  const d=items.find(x=>x.type!=="AVULSA"&&matchesTemplate(x,t));
+                  const done=d&&(d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA");
+                  return(<td key={t.id} style={{padding:"8px 4px",textAlign:"center",borderBottom:`1px solid ${VI.surfaceAlt}`,fontWeight:done?700:400,color:done?(d.status==="CONCLUIDA_NO_PRAZO"?VI.green:VI.yellow):VI.border}}>{done?d.pointsAwarded:"—"}</td>);
+                })}
+                <td style={{padding:"8px 4px",textAlign:"right",fontWeight:700,color:VI.carvao,borderBottom:`1px solid ${VI.surfaceAlt}`}}>{total}</td>
+              </tr>);
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>}
+
+    {supTab==="painel"&&<>
     {alertCount>0&&<div style={{margin:"14px 22px 0",background:VI.redBg,border:`1px solid ${VI.red}44`,borderRadius:10,padding:"11px 15px",display:"flex",alignItems:"center",gap:9}}>
       <Icon name="bell" size={15} color={VI.red}/>
       <span style={{fontSize:12,color:VI.carvao}}>
@@ -2876,13 +3084,80 @@ function SupervisaoDashboard({onLogout}) {
         </div>);
       })}
     </div>
+    </>}
     {showNew&&<NewDemandModal stores={stores} storeId={newStoreId} setStoreId={setNewStoreId}
       quickIdx={quickIdx} onPickQuick={pickQuick}
       title={title} setTitle={setTitle} description={description} setDescription={setDescription}
       dueDate={dueDate} setDueDate={setDueDate} dueTime={dueTime} setDueTime={setDueTime}
       assignTo={assignTo} setAssignTo={setAssignTo}
       saving={saving} onCancel={()=>setShowNew(false)} onCreate={createDemand}/>}
+    {tplEdit&&<FixedTaskModal draft={tplEdit} setDraft={setTplEdit} saving={tplSaving} onCancel={()=>setTplEdit(null)} onSave={submitTpl}/>}
   </AppShell>);
+}
+
+const SUP_TABS=[
+  {id:"painel",label:"Painel",icon:"chart"},
+  {id:"fixas",label:"Tarefas fixas",icon:"list"},
+  {id:"acomp",label:"Acompanhamento",icon:"check"},
+  {id:"pontos",label:"Pontuação",icon:"star"},
+];
+
+// Cadastro/edição de uma tarefa fixa (vale para todas as lojas).
+function FixedTaskModal({draft,setDraft,saving,onCancel,onSave}){
+  const set=(k,v)=>setDraft(d=>({...d,[k]:v}));
+  const valid=draft.title.trim()&&(draft.mode==="clock"?!!draft.clock:Number(draft.minutes)>=0)&&Number(draft.points)>=0;
+  const sel={display:"block",width:"100%",background:VI.cream,border:`1px solid ${VI.border}`,borderRadius:8,padding:"11px 14px",fontSize:14,fontFamily:"inherit",marginBottom:12,cursor:"pointer",color:VI.carvao};
+  const lbl={fontSize:11,color:VI.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:"0.05em"};
+  return(<Modal onClose={onCancel}>
+    <MIcon name="list"/>
+    <h2 style={{fontSize:17,fontWeight:600,color:VI.carvao,marginBottom:5}}>{draft.id?"Editar tarefa fixa":"Nova tarefa fixa"}</h2>
+    <p style={{color:VI.muted,fontSize:13,marginBottom:16}}>Vale para todas as lojas. Cada loja registra a própria conclusão.</p>
+    <Inp placeholder="Título da tarefa" value={draft.title} onChange={e=>set("title",e.target.value)}/>
+    <Inp placeholder="Descrição (opcional)" value={draft.description} onChange={e=>set("description",e.target.value)}/>
+    <div style={lbl}>Grupo</div>
+    <select value={draft.type} onChange={e=>set("type",e.target.value)} style={sel}>
+      <option value="ABERTURA">Abertura</option>
+      <option value="FECHAMENTO">Fechamento</option>
+    </select>
+    <div style={lbl}>Horário limite</div>
+    <select value={draft.mode} onChange={e=>set("mode",e.target.value)} style={sel}>
+      {Object.entries(DEADLINE_MODES).map(([k,v])=><option key={k} value={k}>{v}</option>)}
+    </select>
+    {draft.mode==="clock"
+      ?<input type="time" value={draft.clock||""} onChange={e=>set("clock",e.target.value)} style={{...sel,cursor:"text"}}/>
+      :<Inp type="number" min="0" placeholder="Minutos" value={draft.minutes} onChange={e=>set("minutes",e.target.value)}/>}
+    <div style={lbl}>Pontos (no prazo)</div>
+    <Inp type="number" min="0" value={draft.points} onChange={e=>set("points",e.target.value)}/>
+    <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:4}}>
+      <Btn variant="ghost" onClick={onCancel}>Cancelar</Btn>
+      <Btn variant="accent" disabled={!valid||saving} onClick={onSave}>{saving?"Salvando…":"Salvar"}</Btn>
+    </div>
+  </Modal>);
+}
+
+// Tabela de acompanhamento de uma loja: limite × horário efetivo × situação.
+function TaskTrackTable({items,now}){
+  const rows=[...items].sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt));
+  if(rows.length===0)return <div style={{fontSize:12,color:VI.muted,padding:"6px 0"}}>Sem tarefas hoje (o dia ainda não foi iniciado).</div>;
+  const th={textAlign:"left",padding:"6px 4px",fontSize:10,textTransform:"uppercase",letterSpacing:"0.05em",color:VI.muted,fontWeight:600,borderBottom:`1px solid ${VI.border}`};
+  const td={padding:"7px 4px",borderBottom:`1px solid ${VI.surfaceAlt}`,fontSize:12,color:VI.carvao};
+  return(<div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}>
+    <thead><tr><th style={th}>Tarefa</th><th style={th}>Limite</th><th style={th}>Concluída</th><th style={th}>Situação</th><th style={{...th,textAlign:"right"}}>Pts</th></tr></thead>
+    <tbody>{rows.map(d=>{
+      const done=d.status==="CONCLUIDA_NO_PRAZO"||d.status==="CONCLUIDA_ATRASADA";
+      const overdueOpen=!done&&new Date(d.dueAt)<now;
+      const lateMin=done?Math.round((new Date(d.completedAt)-new Date(d.dueAt))/60000):0;
+      const label=done?(d.status==="CONCLUIDA_NO_PRAZO"?"No prazo":`Atrasou ${Math.max(lateMin,1)}min`):(overdueOpen?"Atrasada":"Pendente");
+      const meta=done?(d.status==="CONCLUIDA_NO_PRAZO"?TASK_STATUS.CONCLUIDA_NO_PRAZO:TASK_STATUS.CONCLUIDA_ATRASADA):(overdueOpen?TASK_STATUS.ATRASADA:TASK_STATUS.PENDENTE);
+      return(<tr key={d.id}>
+        <td style={td}>{d.title}{d.type==="AVULSA"&&<span style={{marginLeft:6,fontSize:9,color:VI.terra,fontWeight:700,textTransform:"uppercase"}}>avulsa</span>}{done&&d.completedBy&&<div style={{fontSize:10,color:VI.muted}}>por {d.completedBy}</div>}</td>
+        <td style={td}>{fmtTime(d.dueAt)}</td>
+        <td style={td}>{done?fmtTime(d.completedAt):"—"}</td>
+        <td style={td}><span style={{fontSize:10,fontWeight:600,padding:"2px 7px",borderRadius:5,background:meta.bg,color:meta.color,whiteSpace:"nowrap"}}>{label}</span></td>
+        <td style={{...td,textAlign:"right",fontWeight:700}}>{done?d.pointsAwarded:"—"}</td>
+      </tr>);
+    })}</tbody>
+  </table></div>);
 }
 
 function LogBadge({status}){
