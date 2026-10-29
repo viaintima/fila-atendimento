@@ -853,6 +853,7 @@ function StoreApp({store,onLogout}) {
   const [demandsReady,setDemandsReady]=useState(false);
   const [fixedTpl,setFixedTpl]=useState(DEFAULT_FIXED_TASKS);
   const [tplReady,setTplReady]=useState(false);
+  const [taskErr,setTaskErr]=useState({read:false,write:false});
   const [activeTask,setActiveTask]=useState(null);
   const [taskNote,setTaskNote]=useState("");
   const [taskWho,setTaskWho]=useState("");
@@ -926,7 +927,12 @@ function StoreApp({store,onLogout}) {
   useEffect(()=>{
     const u=onSnapshot(fixedTasksRef(),snap=>{
       const items=snap.exists()&&Array.isArray(snap.data().items)?snap.data().items:DEFAULT_FIXED_TASKS;
-      setFixedTpl(items);setTplReady(true);
+      setFixedTpl(items);setTplReady(true);setTaskErr(e=>({...e,read:false}));
+    },err=>{
+      // Se o cadastro não puder ser lido (regras do Firebase, rede), a loja NÃO pode
+      // ficar sem tarefas: cai no checklist padrão em vez de esperar para sempre.
+      console.error("tarefasFixas:",err);
+      setFixedTpl(DEFAULT_FIXED_TASKS);setTplReady(true);setTaskErr(e=>({...e,read:true}));
     });
     return()=>u();
   },[]);
@@ -941,9 +947,15 @@ function StoreApp({store,onLogout}) {
     const synced=syncFixedDemands(demands,session.startedAt,store.name,fixedTpl,new Date());
     if(synced){
       setDemands(synced);
-      setDoc(demandsRef(store.id),{items:synced,updatedAt:serverTimestamp()});
+      setDoc(demandsRef(store.id),{items:synced,updatedAt:serverTimestamp()})
+        .then(()=>setTaskErr(e=>e.write?{...e,write:false}:e))
+        .catch(err=>{console.error("demands:",err);setTaskErr(e=>({...e,write:true}));});
     }
   },[session?.startedAt,demandsReady,tplReady,demands,fixedTpl]);
+
+  // Dia anterior não encerrado: a fila continua aberta com a data de ontem, então as
+  // tarefas e prazos são os daquele dia e o checklist de hoje não nasce.
+  const staleDay=!!session?.startedAt&&new Date(session.startedAt).toDateString()!==now.toDateString();
 
   // Escalonamento automático: pendências vencidas passam para a
   // responsável e para a supervisão (spec v3, §4).
@@ -1340,6 +1352,11 @@ function StoreApp({store,onLogout}) {
       <ReportView services={services} queue={queue} tSvc={tSvc} tSales={tSales} conv={conv} demands={demands} onEdit={s=>{setEditSvc(s);setEditStep("main");setEditSubD("");}}/>
     </>}
 
+    {view==="tasks"&&(staleDay||taskErr.read||taskErr.write)&&<div style={{margin:"12px 22px 0",background:VI.yellowBg,border:`1px solid ${VI.yellow}55`,borderRadius:10,padding:"10px 14px",fontSize:12,color:VI.carvao,lineHeight:1.5}}>
+      {staleDay&&<div><strong>O dia de {fmtShort(session.startedAt)} não foi encerrado.</strong> As tarefas abaixo (e os prazos) são desse dia. Para gerar o checklist de hoje, encerre o dia em Relatório → Encerrar dia e inicie um novo.</div>}
+      {taskErr.read&&<div>Não foi possível ler o cadastro de tarefas da Supervisão — usando o checklist padrão. Avise a Supervisão.</div>}
+      {taskErr.write&&<div>Não foi possível salvar as tarefas no servidor (verifique a internet). Elas aparecem aqui, mas podem não chegar à Supervisão.</div>}
+    </div>}
     {view==="tasks"&&<TasksPanel
       demands={demands} now={now} groups={taskGroups} progress={taskProgress}
       nextTask={nextTask} onOpenTask={openTask}/>}
@@ -2851,7 +2868,13 @@ function SupervisaoDashboard({onLogout}) {
   };
 
   // Cadastro central das tarefas fixas (iguais para todas as lojas).
-  const saveTemplates=async(list)=>{await setDoc(fixedTasksRef(),{items:list,updatedAt:serverTimestamp()});};
+  const saveTemplates=async(list)=>{
+    try{await setDoc(fixedTasksRef(),{items:list,updatedAt:serverTimestamp()});}
+    catch(err){
+      console.error("tarefasFixas:",err);
+      alert("Não foi possível salvar as tarefas fixas ("+(err.code||err.message)+"). Se for 'permission-denied', as regras do Firestore precisam permitir escrita em config/tarefasFixas.");
+    }
+  };
   const newTpl=()=>setTplEdit({id:null,type:"ABERTURA",title:"",description:"",points:TASK_POINTS.AVULSA,mode:"clock",minutes:30,clock:"10:00"});
   const submitTpl=async()=>{
     const d=tplEdit;if(!d||!d.title.trim())return;
@@ -3576,4 +3599,94 @@ ${demands.length>0?`<div class="sec nb"><div class="sec-t">Tarefas do Dia</div>
   <div class="kp am"><div class="kn">${tPoints}</div><div class="kl">Pontos</div></div>
 </div>
 ${sortedTaskPoints.length>0?`<table style="margin-top:14px"><thead><tr><th>Funcionária</th><th class="tc">Tarefas</th><th class="tc">Pontos</th></tr></thead>
-<tbody>${sortedTaskPoints.map(p=>`<tr><td class="tn">${p.name}</td><
+<tbody>${sortedTaskPoints.map(p=>`<tr><td class="tn">${p.name}</td><td class="tc">${p.tasks}</td><td class="tc tg">${p.points}</td></tr>`).join("")}</tbody></table>`:""}
+</div>`:""}
+
+${services.length>0?`<div class="sec nb"><div class="sec-t">Movimento por Hora</div>
+<div class="hcont">${hD.map(([h,c])=>{const ip=parseInt(h)===parseInt(pk?.[0])&&c>0;const bh=mH>0?Math.max((c/mH)*64,c>0?3:0):0;return`<div class="hcol"><div class="hv" style="opacity:${c>0?1:0}">${c>0?c:""}</div><div style="flex:1;display:flex;align-items:flex-end;width:100%"><div class="hbar" style="height:${bh}px;background:${ip?"#B5706A":c>0?"#F2B5C0":"#EDD9D3"}"></div></div><div class="hl" style="color:${ip?"#B5706A":"#9E7E78"}">${h}h</div></div>`;}).join("")}</div>
+</div>`:""}
+
+<div class="sec nb"><div class="sec-t">Motivos de Não Venda</div>
+${sR.length===0?'<p style="color:#9E7E78;font-size:13px">Todos os atendimentos resultaram em venda.</p>'
+:sR.map(([l,c])=>`<div class="rb"><div class="rn">${l}</div><div class="rt"><div class="rf" style="width:${Math.round((c/mR)*100)}%"></div></div><div class="rq">${c}</div><div class="rp">${nS.length?Math.round((c/nS.length)*100):0}%</div></div>`).join("")}
+</div>
+
+<div class="sec"><div class="sec-t">Histórico — ${services.length} registro${services.length!==1?"s":""}</div>
+${services.length===0?'<p style="color:#9E7E78">Nenhum atendimento.</p>'
+:services.map(s=>`<div class="hi"><span class="ht">${fmtTime(s.startTime)}</span><span class="hname">${s.salespersonName}</span><span class="hout" style="color:${s.isSale?"#2D7A4F":"#B83232"}">${s.outcomeLabel}</span></div>`).join("")}
+</div>
+
+<div class="ft"><span>Via Íntima · ${storeName} · ${gD}</span><span>Sistema de Atendimento · ${gT}</span></div>
+</div></body></html>`;
+
+  const w=window.open("","_blank");
+  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
+}
+
+function exportPontoPDF(storeName,personName,from,to,days,totalWorkedMin){
+  const gT=new Date().toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
+  const fD=d=>d.toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric"});
+  const wH=(m)=>Math.floor(m/60)>0?`${Math.floor(m/60)}h ${m%60}m`:`${m}m`;
+  const html=`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Folha de Ponto — ${personName}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Sans',sans-serif;color:#2C2020;font-size:13px;line-height:1.5;background:#fff}
+.pg{max-width:860px;margin:0 auto;padding:48px}
+.rh{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:18px;border-bottom:2px solid #F2B5C0;margin-bottom:28px}
+.brand{font-family:Georgia,serif;font-size:12px;font-weight:300;color:#B5706A;letter-spacing:.12em;text-transform:uppercase;margin-bottom:3px}
+.rh h1{font-size:21px;font-weight:600;letter-spacing:-.01em}
+.meta{text-align:right;color:#9E7E78;font-size:12px;line-height:1.8}
+.meta strong{color:#2C2020;font-size:14px;display:block;font-weight:600}
+.sec{margin-bottom:26px}
+.sec-t{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:#9E7E78;margin-bottom:11px;padding-bottom:6px;border-bottom:1px solid #EDD9D3}
+.k2{display:grid;grid-template-columns:repeat(2,1fr);gap:11px}
+.kp{border:1px solid #EDD9D3;border-radius:10px;padding:14px;background:#FDF0EC;text-align:center}
+.kn{font-size:26px;font-weight:700;color:#2C2020;letter-spacing:-.03em;line-height:1}
+.kl{font-size:10px;color:#9E7E78;margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+table{width:100%;border-collapse:collapse}
+thead th{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#9E7E78;padding:7px 9px;text-align:left;border-bottom:1px solid #EDD9D3}
+tbody td{padding:8px 9px;border-bottom:1px solid #F5EDE8;vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+.tn{font-weight:500;color:#2C2020;text-transform:capitalize}.tg{color:#2D7A4F;font-weight:600}.td{color:#9E7E78;font-size:11px}.tc{text-align:center}
+.ft{margin-top:36px;padding-top:12px;border-top:1px solid #EDD9D3;display:flex;justify-content:space-between;color:#9E7E78;font-size:11px}
+.sign{margin-top:56px;display:flex;justify-content:space-between;gap:40px}
+.sign div{flex:1;border-top:1px solid #2C2020;padding-top:6px;text-align:center;font-size:11px;color:#9E7E78}
+@media print{.pg{padding:28px};body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body><div class="pg">
+
+<div class="rh">
+  <div><div class="brand">Via Íntima</div><h1>Folha de Ponto</h1></div>
+  <div class="meta"><strong>${personName}</strong>${storeName}<br>${fD(from)} – ${fD(to)}</div>
+</div>
+
+<div class="sec nb"><div class="sec-t">Resumo do Período</div>
+<div class="k2">
+  <div class="kp"><div class="kn">${days.length}</div><div class="kl">Dias registrados</div></div>
+  <div class="kp"><div class="kn">${wH(totalWorkedMin)}</div><div class="kl">Total de horas</div></div>
+</div>
+</div>
+
+<div class="sec"><div class="sec-t">Registros diários</div>
+<table><thead><tr><th>Data</th><th>Entrada</th><th>Pausas</th><th>Saída</th><th class="tc">Horas</th></tr></thead>
+<tbody>${days.length===0?'<tr><td colspan="5" style="color:#9E7E78;padding:14px 9px">Nenhum registro no período.</td></tr>':days.slice().sort((a,b)=>new Date(a.date)-new Date(b.date)).map(d=>`<tr>
+  <td class="tn">${fmtShort(d.date)}</td>
+  <td class="td">${fmtTime(d.entryTime)}</td>
+  <td class="td">${d.breaks.length===0?"—":d.breaks.map(b=>`${fmtTime(b.start)}–${b.end?fmtTime(b.end):"…"}`).join(", ")}</td>
+  <td class="td">${d.exitTime?fmtTime(d.exitTime):"—"}</td>
+  <td class="tc tg">${wH(d.workedMin)}</td>
+</tr>`).join("")}</tbody></table>
+</div>
+
+<div class="sign">
+  <div>${personName}</div>
+  <div>Supervisão / Administração</div>
+</div>
+
+<div class="ft"><span>Via Íntima · ${storeName} · ${fD(from)} – ${fD(to)}</span><span>Folha de Ponto · gerado às ${gT}</span></div>
+</div></body></html>`;
+
+  const w=window.open("","_blank");
+  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),800);}
+}
